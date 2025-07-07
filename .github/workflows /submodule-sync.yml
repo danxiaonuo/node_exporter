@@ -1,0 +1,51 @@
+name: 'Submodules Sync'
+
+
+# 设置触发条件
+on:
+  # 手动触发工作流
+  workflow_dispatch:
+    inputs:
+      build:
+        description: 'build Sync'
+        required: true
+        default: 'build Sync'
+  # 定时触发编译(每天早5点)
+  schedule:
+     - cron: '* */6 * * *'
+  # 点☆Star触发开始编译
+  watch:  
+     types: [started]
+
+
+jobs:
+  sync:
+    name: 'Submodules Sync'
+    runs-on: ubuntu-latest
+    if: github.event.repository.owner.id == github.event.sender.id || ! github.event.sender.id
+
+    # Use the Bash shell regardless whether the GitHub Actions runner is ubuntu-latest, macos-latest, or windows-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+    # Checkout the repository to the GitHub Actions runner
+    - name: Checkout
+      uses: actions/checkout@v3
+      with:
+        token: ${{ secrets.CI_TOKEN }}
+        submodules: true
+
+    # Update references
+    - name: Git Sumbodule Update
+      run: |
+        git pull --recurse-submodules
+        git submodule update --remote --recursive
+
+    - name: Commit update
+      run: |
+        git config --global user.name 'Git bot'
+        git config --global user.email 'bot@noreply.github.com'
+        git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
+        git commit -am "Auto updated submodule references" && git push || echo "No changes to commit"
