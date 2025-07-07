@@ -30,7 +30,7 @@
 - `PORT_UDP_STATUS_INTERVAL`：UDP端口存在性检测周期，默认与TCP一致。
 - `PROCESS_ALIVE_STATUS_INTERVAL`：进程存活检测缓存刷新周期，默认1分钟。
 - `PORT_LABEL_INTERVAL`：端口-进程标签发现周期，默认8小时。
-- `PORT_CHECK_TIMEOUT`：TCP/HTTP检测超时时间，默认1分钟，支持慢服务和网络抖动。
+- `PORT_CHECK_TIMEOUT`：TCP/HTTP检测超时时间，默认2秒，支持慢服务和网络抖动。
 - `MAX_PARALLEL_IP_CHECKS`：检测所有本地IP时的最大并发数，默认8，防止极端大规模主机拖垮性能。
 - `EXCLUDED_PROCESS_NAMES`：自定义排除进程名，逗号分隔。
 - `PROC_PREFIX`：容器环境下指定proc路径前缀。
@@ -42,7 +42,7 @@ export PORT_HTTP_STATUS_INTERVAL=1m
 export PORT_UDP_STATUS_INTERVAL=1m
 export PROCESS_ALIVE_STATUS_INTERVAL=1m
 export PORT_LABEL_INTERVAL=8h
-export PORT_CHECK_TIMEOUT=1m
+export PORT_CHECK_TIMEOUT=2s
 export MAX_PARALLEL_IP_CHECKS=8
 export EXCLUDED_PROCESS_NAMES=nginx,redis,customapp
 ```
@@ -56,7 +56,7 @@ node_tcp_port_alive{process_name="nginx", exe_path="/usr/sbin/nginx", port="80"}
 - 1 表示TCP端口可建立连接，0 表示端口不可访问。
 - 检测结果有缓存，刷新周期由 `PORT_STATUS_INTERVAL` 控制。
 - 支持IPv4和IPv6监听端口。
-- 检测超时时间可通过 `PORT_CHECK_TIMEOUT` 配置，默认1分钟。
+- 检测超时时间可通过 `PORT_CHECK_TIMEOUT` 配置，默认2秒。
 - 检测所有本地IP时最大并发数可通过 `MAX_PARALLEL_IP_CHECKS` 配置，默认8。
 
 ### 2. TCP端口响应时间
@@ -73,7 +73,7 @@ node_http_port_alive{process_name="nginx", exe_path="/usr/sbin/nginx", port="80"
 - 1 表示HTTP服务可访问（有响应头），0 表示HTTP服务不可用或假死。
 - 仅对曾经HTTP检测通过的端口暴露，且检测结果有缓存，刷新周期由 `PORT_HTTP_STATUS_INTERVAL` 控制。
 - 支持IPv4和IPv6监听端口。
-- 检测超时时间可通过 `PORT_CHECK_TIMEOUT` 配置，默认1分钟。
+- 检测超时时间可通过 `PORT_CHECK_TIMEOUT` 配置，默认2秒。
 - 检测所有本地IP时最大并发数可通过 `MAX_PARALLEL_IP_CHECKS` 配置，默认8。
 
 ### 4. UDP端口存活状态
@@ -142,7 +142,7 @@ node_process_alive{process_name="nginx", exe_path="/usr/sbin/nginx"} 1
 - **Q: 进程存活是怎么判断的？**
   - 只要 `/proc/<pid>` 存在即认为存活，检测结果有缓存，周期可配置。
 - **Q: TCP/HTTP检测超时时间和并发数能否调整？**
-  - 可以，通过 `PORT_CHECK_TIMEOUT` 和 `MAX_PARALLEL_IP_CHECKS` 环境变量配置，默认1分钟和8，适合慢服务、网络抖动和极端大规模主机场景。
+  - 可以，通过 `PORT_CHECK_TIMEOUT` 和 `MAX_PARALLEL_IP_CHECKS` 环境变量配置，默认2秒和8，适合慢服务、网络抖动和极端大规模主机场景。
 - **Q: TCP/HTTP检测能否支持IPv6监听端口？**
   - 已支持，自动遍历所有本地IPv4和IPv6地址。
 
@@ -426,3 +426,19 @@ env:
 ```
 
 这样配置后，所有进程名包含 `nginx`、`redis`、`customapp` 的进程都会被排除，不会被采集。
+
+### 端口检测超时时间（PORT_CHECK_TIMEOUT）
+
+- 作用：控制每个端口检测的最大等待时间，防止慢服务或网络异常拖慢整体采集。
+- 配置方式：
+  - 环境变量 `PORT_CHECK_TIMEOUT`，如 `2s`、`5s`、`1m` 等。
+  - **默认值：2秒**（2s）。
+- 建议：
+  - 绝大多数生产环境建议保持2秒或更低。
+  - 仅在极端慢服务排查时临时调大。
+  - 超时时间过大（如1分钟）会极大拖慢 /metrics 暴露速度，尤其在端口未监听或IP不可达时。
+
+示例：
+```sh
+export PORT_CHECK_TIMEOUT=2s
+```

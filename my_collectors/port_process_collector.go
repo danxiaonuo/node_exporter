@@ -183,7 +183,7 @@ var (
 				return d
 			}
 		}
-		return time.Minute
+		return 2 * time.Second
 	}()
 	maxParallelIPChecks = func() int {
 		if v := os.Getenv("MAX_PARALLEL_IP_CHECKS"); v != "" {
