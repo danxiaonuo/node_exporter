@@ -5,34 +5,47 @@
 本插件用于自动发现主机（支持物理机和容器）上的所有监听TCP和UDP端口及其关联进程，并监控端口存活、进程存活、端口响应时间等关键指标。适用于 Prometheus 监控体系，便于故障告警和运维分析。
 
 - 自动发现主机所有监听**TCP/UDP端口**及其进程（标签内容每8小时刷新一次，周期可配置）
-- 检测TCP端口是否存活（可访问/假死检测，检测周期可配置，默认每1分钟检测一次）
-- 检测UDP端口是否存在（只判断端口存在性）
-- 检测TCP端口响应时间（秒，UDP不采集响应时间，检测周期同上）
-- 检测进程是否存活
+- 检测TCP端口是否存活（带检测缓存，周期可配置，默认每1分钟检测一次）
+- 检测UDP端口是否存在（带检测缓存，周期可配置，默认每1分钟检测一次）
+- 检测HTTP端口存活（带检测缓存，周期可配置，默认每1分钟检测一次，仅对曾经HTTP存活的端口暴露）
+- 检测TCP端口响应时间（带检测缓存，周期同上）
+- 检测进程是否存活（无检测缓存，每次采集实时判断）
 - 支持排除常见系统和监控进程，避免无意义采集
 - 适用于物理机和容器环境
-- **TCP/UDP端口指标名称区分，UDP端口只采集存在性，不采集响应时间**
+- **TCP/UDP/HTTP端口指标名称区分，UDP端口只采集存在性（带检测缓存），不采集响应时间**
 
-## 检测周期说明
+## 检测周期与缓存机制
 
-- **端口状态检测周期**（PORT_STATUS_INTERVAL）：
-  - 控制 TCP 端口存活状态（1/0）和响应时间的检测频率。
-  - 可通过环境变量 `PORT_STATUS_INTERVAL` 配置，支持 Go duration 格式（如 `1m`, `30s`）。
-  - 默认值为 `1m`（每1分钟检测一次）。
+| 指标类型                | 检测缓存 | 环境变量                      | 默认周期   | 说明 |
+|------------------------|----------|-------------------------------|------------|------|
+| TCP端口存活/响应时间    | 有       | PORT_STATUS_INTERVAL, PORT_CHECK_TIMEOUT, MAX_PARALLEL_IP_CHECKS | 1分钟      | 端口可达性/响应时间，周期缓存，支持IPv4/IPv6，超时/并发可配 |
+| HTTP端口存活           | 有       | PORT_HTTP_STATUS_INTERVAL, PORT_CHECK_TIMEOUT, MAX_PARALLEL_IP_CHECKS | 1分钟      | 仅对曾经HTTP存活的端口暴露，周期缓存，支持IPv4/IPv6，超时/并发可配 |
+| UDP端口存在性          | 有       | PORT_UDP_STATUS_INTERVAL      | 1分钟      | 仅判断fd存在，周期缓存 |
+| 进程存活               | 有       | PROCESS_ALIVE_STATUS_INTERVAL | 1分钟      | 进程是否存活，周期缓存 |
+| 端口-进程标签发现      | 有       | PORT_LABEL_INTERVAL           | 8小时      | 端口-进程映射，周期缓存 |
 
-- **标签内容检测周期**（PORT_LABEL_INTERVAL）：
-  - 控制端口-进程映射（即指标标签内容，如 process_name、exe_path、port）的刷新频率。
-  - 可通过环境变量 `PORT_LABEL_INTERVAL` 配置，支持 Go duration 格式。
-  - 默认值为 `8h`（每8小时刷新一次标签内容）。
+### 环境变量说明
+- `PORT_STATUS_INTERVAL`：TCP端口存活/响应时间检测周期，默认1分钟。
+- `PORT_HTTP_STATUS_INTERVAL`：HTTP端口存活检测周期，默认与TCP一致。
+- `PORT_UDP_STATUS_INTERVAL`：UDP端口存在性检测周期，默认与TCP一致。
+- `PROCESS_ALIVE_STATUS_INTERVAL`：进程存活检测缓存刷新周期，默认1分钟。
+- `PORT_LABEL_INTERVAL`：端口-进程标签发现周期，默认8小时。
+- `PORT_CHECK_TIMEOUT`：TCP/HTTP检测超时时间，默认1分钟，支持慢服务和网络抖动。
+- `MAX_PARALLEL_IP_CHECKS`：检测所有本地IP时的最大并发数，默认8，防止极端大规模主机拖垮性能。
+- `EXCLUDED_PROCESS_NAMES`：自定义排除进程名，逗号分隔。
+- `PROC_PREFIX`：容器环境下指定proc路径前缀。
 
 ### 配置示例
-
 ```sh
 export PORT_STATUS_INTERVAL=1m
+export PORT_HTTP_STATUS_INTERVAL=1m
+export PORT_UDP_STATUS_INTERVAL=1m
+export PROCESS_ALIVE_STATUS_INTERVAL=1m
 export PORT_LABEL_INTERVAL=8h
+export PORT_CHECK_TIMEOUT=1m
+export MAX_PARALLEL_IP_CHECKS=8
+export EXCLUDED_PROCESS_NAMES=nginx,redis,customapp
 ```
-
-这样配置后，端口状态和响应时间每1分钟检测一次，标签内容每8小时刷新一次。
 
 ## 指标说明
 
@@ -41,44 +54,42 @@ export PORT_LABEL_INTERVAL=8h
 node_tcp_port_alive{process_name="nginx", exe_path="/usr/sbin/nginx", port="80"} 1
 ```
 - 1 表示TCP端口可建立连接，0 表示端口不可访问。
-- labels:
-  - process_name：进程名
-  - exe_path：可执行文件路径
-  - port：端口号
-- **此指标只检测TCP连接是否可达，不做HTTP请求。**
+- 检测结果有缓存，刷新周期由 `PORT_STATUS_INTERVAL` 控制。
+- 支持IPv4和IPv6监听端口。
+- 检测超时时间可通过 `PORT_CHECK_TIMEOUT` 配置，默认1分钟。
+- 检测所有本地IP时最大并发数可通过 `MAX_PARALLEL_IP_CHECKS` 配置，默认8。
 
 ### 2. TCP端口响应时间
 ```
 node_tcp_port_response_seconds{process_name="nginx", exe_path="/usr/sbin/nginx", port="80"} 0.0015
 ```
 - 数值为TCP端口连接耗时（单位：秒）。
-- labels 同上。
-- **此指标只反映TCP连接耗时，不包含HTTP响应时间。**
+- 检测结果有缓存，刷新周期同上。
 
 ### 3. HTTP端口存活状态（假死检测）
 ```
 node_http_port_alive{process_name="nginx", exe_path="/usr/sbin/nginx", port="80"} 1
 ```
 - 1 表示HTTP服务可访问（有响应头），0 表示HTTP服务不可用或假死。
-- labels 同上。
-- **此指标专门检测HTTP服务可用性，适合做Web服务假死/异常监控。**
+- 仅对曾经HTTP检测通过的端口暴露，且检测结果有缓存，刷新周期由 `PORT_HTTP_STATUS_INTERVAL` 控制。
+- 支持IPv4和IPv6监听端口。
+- 检测超时时间可通过 `PORT_CHECK_TIMEOUT` 配置，默认1分钟。
+- 检测所有本地IP时最大并发数可通过 `MAX_PARALLEL_IP_CHECKS` 配置，默认8。
 
 ### 4. UDP端口存活状态
 ```
 node_udp_port_alive{process_name="dnsmasq", exe_path="/usr/sbin/dnsmasq", port="53"} 1
 ```
-- 1 表示UDP端口存在。
-- labels 同上。
-- **UDP端口不采集响应时间。**
+- 1 表示UDP端口存在（进程fd存在）。
+- 检测结果有缓存，刷新周期由 `PORT_UDP_STATUS_INTERVAL` 控制。
+- UDP端口不采集响应时间。
 
 ### 5. 进程存活状态
 ```
 node_process_alive{process_name="nginx", exe_path="/usr/sbin/nginx"} 1
 ```
 - 1 表示进程存活，0 表示进程不存在。
-- labels:
-  - process_name：进程名
-  - exe_path：可执行文件路径
+- 检测结果有缓存，刷新周期由 `PROCESS_ALIVE_STATUS_INTERVAL` 控制。
 
 ## 工作原理
 
@@ -86,33 +97,34 @@ node_process_alive{process_name="nginx", exe_path="/usr/sbin/nginx"} 1
    - 每隔 `PORT_LABEL_INTERVAL`（默认8小时）扫描一次 `/proc` 目录，发现所有监听**TCP/UDP端口**及其关联进程。
    - 只采集 LISTEN 状态的TCP端口和所有UDP端口。
    - TCP/UDP端口分别去重（同一协议下同一端口只采集一次）。
-   - 排除常见系统进程和监控进程（如 systemd、zabbix、prometheus、node_exporter 等）。
+   - 排除常见系统进程和监控进程（如 systemd、zabbix、prometheus、node_exporter 等），可通过环境变量扩展。
+   - **TCP/HTTP检测流程：先串行检测常用地址（127.0.0.1、0.0.0.0、::1、::），全部不通再对所有本地IP做有限并发检测（最大并发数可配），一旦有一个成功立即返回，极端大规模主机下也能兼顾性能和准确性。**
    - **TCP端口采集 /proc/net/tcp 和 /proc/net/tcp6，UDP端口采集 /proc/net/udp 和 /proc/net/udp6。**
 2. **端口状态与响应时间检测**：
-   - 每隔 `PORT_STATUS_INTERVAL`（默认1分钟）检测一次所有已发现TCP端口的存活状态和响应时间。
-   - `node_tcp_port_alive` 只检测TCP连接是否可达。
+   - 每隔 `PORT_STATUS_INTERVAL`（默认1分钟）检测一次所有已发现TCP端口的存活状态和响应时间，结果有缓存。
+   - `node_tcp_port_alive` 只检测TCP连接是否可达，支持IPv4/IPv6，超时/并发可配。
    - `node_tcp_port_response_seconds` 只反映TCP连接耗时。
-   - `node_http_port_alive` 检测HTTP服务可用性（假死检测，检测周期同上）。
-   - UDP端口只判断端口存在，不检测连通性和响应时间。
-   - 进程检测只要 `/proc/<pid>` 存在即认为存活。
+   - `node_http_port_alive` 检测HTTP服务可用性（假死检测，检测周期同上，仅对曾经HTTP检测通过的端口暴露，结果有缓存，支持IPv4/IPv6，超时/并发可配）。
+   - UDP端口只判断端口存在（进程fd存在），检测结果有缓存，周期可配置。
+   - 进程检测只要 `/proc/<pid>` 存在即认为存活，检测结果有缓存，周期可配置。
 
 ## 使用方法
 
 1. 将 `port_process_collector.go` 添加到 `my_collectors/` 目录。
-2. 在 node_exporter 的采集器注册机制中注册该 Collector（如自动注册脚本）。
+2. 运行自动注册脚本（见下文自动注册机制）。
 3. 重新编译并运行 node_exporter。
 4. 访问 `/metrics`，即可看到相关指标。
 
 ## 注意事项
 
-- 端口/进程发现周期和端口状态检测周期均可通过环境变量配置，详见上文。
+- 所有检测缓存周期均可通过环境变量配置，详见上文。
 - 只采集 LISTEN 状态的TCP端口和所有UDP端口。
 - TCP/UDP端口分别去重（同一协议下同一端口只采集一次）。
-- 排除列表可在 `isExcludedProcess` 函数中自定义。
+- 排除列表可通过 `EXCLUDED_PROCESS_NAMES` 环境变量自定义。
 - 插件对服务器性能影响极小，适合生产环境使用。
-- **UDP端口只采集存在性，不采集响应时间。**
+- **UDP端口只采集存在性（带检测缓存，周期可配置），不采集响应时间。**
 - **本采集器已适配 node_exporter 的本地 Collector 接口，实现了 Update 方法，兼容 Prometheus 和 node_exporter 框架。**
-- **node_process_alive 指标只会为每个唯一进程采集和上报一次，避免重复指标冲突。**
+- **node_process_alive 指标只会为每个唯一进程采集和上报一次，检测结果有缓存，周期可配置，避免重复指标冲突。**
 - **{process_name, exe_path} 的对象池是在首次启动和每次标签刷新周期时更新，采集指标时遍历的是上次发现的那一批对象。**
 
 ## 常见问题
@@ -120,9 +132,19 @@ node_process_alive{process_name="nginx", exe_path="/usr/sbin/nginx"} 1
 - **Q: 为什么有些端口/进程没有被采集？**
   - 可能被排除列表过滤，或进程未监听TCP/UDP端口。
 - **Q: 如何调整检测周期？**
-  - 通过环境变量 `PORT_STATUS_INTERVAL` 和 `PORT_LABEL_INTERVAL` 配置。
+  - 通过环境变量 `PORT_STATUS_INTERVAL`、`PORT_HTTP_STATUS_INTERVAL`、`PORT_UDP_STATUS_INTERVAL`、`PORT_LABEL_INTERVAL` 配置。
 - **Q: 如何只采集特定端口或进程？**
-  - 可在 `discoverPortProcess` 中增加白名单逻辑。
+  - 可在 `discoverPortProcess` 中增加白名单逻辑，或通过排除环境变量控制。
+- **Q: HTTP端口指标为什么有的端口不暴露？**
+  - 只有曾经HTTP检测通过的端口才会暴露该指标，且端口消失后指标消失。
+- **Q: UDP端口存活是怎么判断的？**
+  - 只要进程fd存在该端口即认为存在，检测结果有缓存。
+- **Q: 进程存活是怎么判断的？**
+  - 只要 `/proc/<pid>` 存在即认为存活，检测结果有缓存，周期可配置。
+- **Q: TCP/HTTP检测超时时间和并发数能否调整？**
+  - 可以，通过 `PORT_CHECK_TIMEOUT` 和 `MAX_PARALLEL_IP_CHECKS` 环境变量配置，默认1分钟和8，适合慢服务、网络抖动和极端大规模主机场景。
+- **Q: TCP/HTTP检测能否支持IPv6监听端口？**
+  - 已支持，自动遍历所有本地IPv4和IPv6地址。
 
 ## 联系与支持
 
@@ -195,21 +217,30 @@ node_exporter/
 
 本项目支持自动注册 `my_collectors/` 目录下的所有自定义采集器，无需手动修改 `collector/collector.go`。
 
-### 自动注册脚本
+### 自动注册脚本原理
 
 - 脚本位置：`my_collectors/auto_register_collectors.sh`
 - 适用平台：Linux（Bash）
-- 功能：
-  - 自动扫描 `my_collectors/` 下所有 `*_collector.go` 文件
-  - 自动生成 import 和注册代码，插入到 `collector/collector.go`
-  - 幂等安全，重复运行不会产生重复注册或脏数据
-  - 自动将插件源码复制到 `node_exporter/my_collectors/` 目录下
+- 主要功能：
+  1. 自动扫描 `my_collectors/` 下所有 `*_collector.go` 文件。
+  2. 自动将所有插件源码复制到 `node_exporter/my_collectors/` 目录下（保持同步）。
+  3. 自动生成 import 语句和注册代码（调用 `registerCollector`），插入到 `node_exporter/collector/collector.go` 的 import 块和 init 块中。
+  4. import 块和 init 块均为自动生成，重复运行脚本不会产生重复注册或脏数据（幂等安全）。
+  5. 构造函数命名规范：文件名如 `foo_bar_collector.go`，则需导出 `NewFooBarCollector()`。
+  6. 注册名为文件名前缀（去掉 `_collector`），如 `foo_bar_collector.go` 注册名为 `foo_bar`。
+  7. import 路径统一为 `github.com/prometheus/node_exporter/my_collectors`。
+  8. 注册代码格式：
+     ```go
+     registerCollector("foo_bar", defaultEnabled, func(logger *slog.Logger) (Collector, error) {
+         return my_collectors.NewFooBarCollector(), nil
+     })
+     ```
 
-#### 使用方法
+### 使用方法
 
 1. **添加新插件**
    - 在 `my_collectors/` 目录下新建如 `foo_bar_collector.go`，包名为 `my_collectors`，导出构造函数 `NewFooBarCollector()`。
-   - **注意：文件名中的下划线会自动转为驼峰，构造函数名需与之对应。**
+   - 文件名中的下划线会自动转为驼峰，构造函数名需与之对应。
      - 例如：`port_process_collector.go` → `NewPortProcessCollector()`
      - 例如：`foo_bar_collector.go` → `NewFooBarCollector()`
 2. **运行自动注册脚本**
@@ -218,27 +249,23 @@ node_exporter/
    ```
    - 脚本会自动：
      - 复制所有插件到 `node_exporter/my_collectors/`
-     - 修改 `collector/collector.go`，插入 import 和注册代码
-     - 保证 import 块和 init 注册块不会重复、不会破坏原有内容
-
+     - 修改 `collector/collector.go`，插入 import 和注册代码（import块和init块自动生成，原有内容保留）
+     - 幂等安全，重复运行不会重复注册
 3. **编译 node_exporter**
    ```sh
    cd node_exporter
    go build -o node_exporter
    ```
-
 4. **运行并验证**
    - 启动 node_exporter，访问 `/metrics`，即可看到自定义插件的指标。
 
-#### 构造函数命名规范
+### 注意事项
 
 - 插件文件名需为 `xxx_collector.go`，注册名为 `xxx`（下划线分隔）。
 - 构造函数必须导出，命名为 `NewXxxCollector`，其中 `Xxx` 为下划线转驼峰（首字母大写）。
-  - 例如：
-    - `port_process_collector.go` → `NewPortProcessCollector()`
-    - `foo_bar_collector.go` → `NewFooBarCollector()`
-    - `my_custom_collector.go` → `NewMyCustomCollector()`
-- 注册时自动调用，无需手动修改 `
+- 注册时自动调用，无需手动修改 `collector.go`。
+- import 路径和注册代码均由脚本自动生成。
+- 支持多插件自动注册，适合批量管理和持续集成。
 
 ## Docker 和 Kubernetes 环境运行说明
 
