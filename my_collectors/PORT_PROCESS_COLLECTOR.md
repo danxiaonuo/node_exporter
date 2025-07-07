@@ -239,3 +239,106 @@ node_exporter/
     - `foo_bar_collector.go` → `NewFooBarCollector()`
     - `my_custom_collector.go` → `NewMyCustomCollector()`
 - 注册时自动调用，无需手动修改 `
+
+## Docker 和 Kubernetes 环境运行说明
+
+### 一、Docker 运行示例
+
+#### 1. 采集宿主机进程/端口（推荐配置）
+
+```sh
+docker run --rm \
+  --privileged \
+  -v /proc:/host/proc:ro \
+  -e PROC_PREFIX=/host/proc \
+  --user root \
+  your_image_name
+```
+
+- `--privileged`：容器拥有所有宿主机能力，能访问 /proc 下所有进程。
+- `-v /proc:/host/proc:ro`：挂载宿主机 /proc 到容器内 /host/proc。
+- `-e PROC_PREFIX=/host/proc`：让采集器访问宿主机 /proc。
+- `--user root`：以 root 用户运行，避免权限不足。
+
+#### 2. docker-compose 示例
+
+```yaml
+services:
+  node_exporter:
+    image: your_image_name
+    privileged: true
+    user: root
+    volumes:
+      - /proc:/host/proc:ro
+    environment:
+      - PROC_PREFIX=/host/proc
+    restart: always
+```
+
+### 二、Kubernetes 运行示例
+
+#### 1. 采集宿主机进程/端口（Pod/DaemonSet）
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: node-exporter
+spec:
+  containers:
+    - name: node-exporter
+      image: your_image_name
+      securityContext:
+        privileged: true
+        runAsUser: 0
+        allowPrivilegeEscalation: true
+      volumeMounts:
+        - name: proc
+          mountPath: /host/proc
+          readOnly: true
+      env:
+        - name: PROC_PREFIX
+          value: /host/proc
+  volumes:
+    - name: proc
+      hostPath:
+        path: /proc
+        type: Directory
+```
+
+#### 2. DaemonSet 示例（每台节点部署一个）
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-exporter
+spec:
+  template:
+    spec:
+      containers:
+        - name: node-exporter
+          image: your_image_name
+          securityContext:
+            privileged: true
+            runAsUser: 0
+            allowPrivilegeEscalation: true
+          volumeMounts:
+            - name: proc
+              mountPath: /host/proc
+              readOnly: true
+          env:
+            - name: PROC_PREFIX
+              value: /host/proc
+      volumes:
+        - name: proc
+          hostPath:
+            path: /proc
+            type: Directory
+```
+
+### 注意事项
+
+- 容器内如需采集宿主机进程/端口，必须以 root 用户、特权模式运行，并挂载宿主机 /proc。
+- 如果宿主机 /proc 挂载了 hidepid=1/2，则即使 root 也无法访问其他用户进程的 fd，需宿主机 /proc 为 hidepid=0。
+- 生产环境下，特权容器有安全风险，请根据实际需求权衡。
