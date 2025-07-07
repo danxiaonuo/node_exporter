@@ -25,7 +25,7 @@ jobs:
 
     steps:
       - name: 检出代码（包含子模块）
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           submodules: true
 
@@ -53,7 +53,7 @@ jobs:
 
       # 上传所有平台的二进制文件到 GitHub Actions 构建产物区
       - name: 上传多平台二进制文件
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: node_exporter-binaries
           path: |
