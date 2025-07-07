@@ -37,8 +37,16 @@ type portProcessCacheStruct struct {
 
 var portProcessCache = &portProcessCacheStruct{}
 
-// 扫描周期，单位为小时。每8小时自动重新扫描一次端口和进程列表
-const scanInterval = 8 * time.Hour
+// 标签缓存周期可配置
+var scanInterval = func() time.Duration {
+	if v := os.Getenv("PORT_LABEL_INTERVAL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err == nil {
+			return d
+		}
+	}
+	return 8 * time.Hour
+}()
 
 var procPrefix = func() string {
 	if p := os.Getenv("PROC_PREFIX"); p != "" {
@@ -123,7 +131,7 @@ func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 		labels := []string{info.ProcessName, info.ExePath, strconv.Itoa(info.Port)}
 		if info.Protocol == "tcp" {
 			if !tcpPortDone[info.Port] {
-				alive, respTime := checkPortTCP(info.Port)
+				alive, respTime := getPortStatus(info.Port)
 				ch <- prometheus.MustNewConstMetric(
 					c.portTCPAliveDesc, prometheus.GaugeValue, float64(alive), labels...,
 				)
@@ -401,4 +409,54 @@ func isExcludedProcess(exeName string) bool {
 func (c *PortProcessCollector) Update(ch chan<- prometheus.Metric) error {
 	c.Collect(ch)
 	return nil
+}
+
+var (
+	portStatusInterval = func() time.Duration {
+		if v := os.Getenv("PORT_STATUS_INTERVAL"); v != "" {
+			d, err := time.ParseDuration(v)
+			if err == nil {
+				return d
+			}
+		}
+		return time.Minute
+	}()
+	portLabelInterval = func() time.Duration {
+		if v := os.Getenv("PORT_LABEL_INTERVAL"); v != "" {
+			d, err := time.ParseDuration(v)
+			if err == nil {
+				return d
+			}
+		}
+		return 8 * time.Hour
+	}()
+)
+
+type portStatusCacheStruct struct {
+	LastCheck map[int]time.Time
+	Status    map[int]int
+	RespTime  map[int]float64
+	Mutex     sync.Mutex
+}
+
+var portStatusCache = &portStatusCacheStruct{
+	LastCheck: make(map[int]time.Time),
+	Status:    make(map[int]int),
+	RespTime:  make(map[int]float64),
+}
+
+func getPortStatus(port int) (alive int, respTime float64) {
+	portStatusCache.Mutex.Lock()
+	defer portStatusCache.Mutex.Unlock()
+	now := time.Now()
+	if t, ok := portStatusCache.LastCheck[port]; !ok || now.Sub(t) > portStatusInterval {
+		alive, respTime = checkPortTCP(port)
+		portStatusCache.Status[port] = alive
+		portStatusCache.RespTime[port] = respTime
+		portStatusCache.LastCheck[port] = now
+	} else {
+		alive = portStatusCache.Status[port]
+		respTime = portStatusCache.RespTime[port]
+	}
+	return
 }
