@@ -90,20 +90,22 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GHCR_TOKEN }}
 
+      - name: 清理 amd64 builder
+        run: docker buildx rm builder-amd64 || true
+
       - name: 创建 amd64 builder
-        run: |
-          docker buildx create --name builder-amd64 --use || docker buildx use builder-amd64
-          docker buildx inspect --bootstrap
+        run: docker buildx create --name builder-amd64 --use
 
       - name: 构建并推送 amd64 镜像
         run: |
           docker buildx use builder-amd64
           docker buildx build --platform linux/amd64 --build-arg ARCH=amd64 --build-arg OS=linux -f node_exporter/Dockerfile -t ${{ github.repository_owner }}/node_exporter:amd64 -t ghcr.io/${{ github.repository_owner }}/node_exporter:amd64 --push ./node_exporter
 
+      - name: 清理 arm64 builder
+        run: docker buildx rm builder-arm64 || true
+
       - name: 创建 arm64 builder
-        run: |
-          docker buildx create --name builder-arm64 --use || docker buildx use builder-arm64
-          docker buildx inspect --bootstrap
+        run: docker buildx create --name builder-arm64 --use
 
       - name: 构建并推送 arm64 镜像
         run: |
