@@ -200,7 +200,7 @@ type portStatusCacheStruct struct {
 	LastCheck map[int]time.Time
 	Status    map[int]int
 	RespTime  map[int]float64
-	Mutex     sync.Mutex
+	RWMutex   sync.RWMutex
 }
 
 var portStatusCache = &portStatusCacheStruct{
@@ -214,7 +214,7 @@ var portStatusCache = &portStatusCacheStruct{
 type httpStatusCacheStruct struct {
 	LastCheck map[int]time.Time
 	Status    map[int]int
-	Mutex     sync.Mutex
+	RWMutex   sync.RWMutex
 }
 
 var httpStatusCache = &httpStatusCacheStruct{
@@ -227,7 +227,7 @@ var httpStatusCache = &httpStatusCacheStruct{
 type udpStatusCacheStruct struct {
 	LastCheck map[int]time.Time
 	Status    map[int]int
-	Mutex     sync.Mutex
+	RWMutex   sync.RWMutex
 }
 
 var udpStatusCache = &udpStatusCacheStruct{
@@ -240,7 +240,7 @@ var udpStatusCache = &udpStatusCacheStruct{
 type processAliveCacheStruct struct {
 	LastCheck map[string]time.Time
 	Status    map[string]int
-	Mutex     sync.Mutex
+	RWMutex   sync.RWMutex
 }
 
 var processAliveCache = &processAliveCacheStruct{
@@ -461,7 +461,7 @@ func parseInodePortMap(files []string, proto string) map[string]int {
 // 返回值：alive（1=存活，0=不可用），respTime（TCP连接耗时，秒）
 func checkPortTCP(port int) (alive int, respTime float64) {
 	commonAddrs := []string{"127.0.0.1", "0.0.0.0", "::1", "::"}
-	minResp := 9999.0
+	minResp := -1.0 // 检测失败时返回-1
 	found := false
 	// 先检测常用地址
 	for _, ip := range commonAddrs {
@@ -470,7 +470,7 @@ func checkPortTCP(port int) (alive int, respTime float64) {
 		cost := time.Since(start).Seconds()
 		if err == nil {
 			conn.Close()
-			if cost < minResp {
+			if minResp < 0 || cost < minResp {
 				minResp = cost
 			}
 			found = true
@@ -491,6 +491,10 @@ func checkPortTCP(port int) (alive int, respTime float64) {
 			ip = v.IP
 		}
 		if ip == nil {
+			continue
+		}
+		// 过滤掉无效地址：只检测GlobalUnicast
+		if !ip.IsGlobalUnicast() {
 			continue
 		}
 		addrs = append(addrs, ip.String())
@@ -535,7 +539,7 @@ func checkPortTCP(port int) (alive int, respTime float64) {
 	for resp := range resultCh {
 		return 1, resp
 	}
-	return 0, 0
+	return 0, 0 // 检测失败时respTime返回0
 }
 
 // checkPortHTTP 并发检测所有本地IP，常用地址串行，其他并发，取最快成功
@@ -712,48 +716,81 @@ func (c *PortProcessCollector) Update(ch chan<- prometheus.Metric) error {
 }
 
 func getPortStatus(port int) (alive int, respTime float64) {
-	portStatusCache.Mutex.Lock()
-	defer portStatusCache.Mutex.Unlock()
+	portStatusCache.RWMutex.RLock()
 	now := time.Now()
-	if t, ok := portStatusCache.LastCheck[port]; !ok || now.Sub(t) > portStatusInterval {
-		alive, respTime = checkPortTCP(port)
-		portStatusCache.Status[port] = alive
-		portStatusCache.RespTime[port] = respTime
-		portStatusCache.LastCheck[port] = now
-	} else {
-		alive = portStatusCache.Status[port]
-		respTime = portStatusCache.RespTime[port]
+	t, ok := portStatusCache.LastCheck[port]
+	if !ok || now.Sub(t) > portStatusInterval {
+		portStatusCache.RWMutex.RUnlock()
+		portStatusCache.RWMutex.Lock()
+		// 再次检查，防止并发下重复写
+		t, ok = portStatusCache.LastCheck[port]
+		if !ok || now.Sub(t) > portStatusInterval {
+			alive, respTime = checkPortTCP(port)
+			portStatusCache.Status[port] = alive
+			portStatusCache.RespTime[port] = respTime
+			portStatusCache.LastCheck[port] = now
+		} else {
+			alive = portStatusCache.Status[port]
+			respTime = portStatusCache.RespTime[port]
+		}
+		portStatusCache.RWMutex.Unlock()
+		return
 	}
+	alive = portStatusCache.Status[port]
+	respTime = portStatusCache.RespTime[port]
+	portStatusCache.RWMutex.RUnlock()
 	return
 }
 
 // 新增：带缓存的 HTTP 检测
 func getPortHTTPStatus(port int) int {
-	httpStatusCache.Mutex.Lock()
-	defer httpStatusCache.Mutex.Unlock()
+	httpStatusCache.RWMutex.RLock()
 	now := time.Now()
-	if t, ok := httpStatusCache.LastCheck[port]; !ok || now.Sub(t) > httpStatusInterval {
-		status := checkPortHTTP(port)
-		httpStatusCache.Status[port] = status
-		httpStatusCache.LastCheck[port] = now
-		return status
-	} else {
-		return httpStatusCache.Status[port]
+	t, ok := httpStatusCache.LastCheck[port]
+	if !ok || now.Sub(t) > httpStatusInterval {
+		httpStatusCache.RWMutex.RUnlock()
+		httpStatusCache.RWMutex.Lock()
+		t, ok = httpStatusCache.LastCheck[port]
+		if !ok || now.Sub(t) > httpStatusInterval {
+			status := checkPortHTTP(port)
+			httpStatusCache.Status[port] = status
+			httpStatusCache.LastCheck[port] = now
+			httpStatusCache.RWMutex.Unlock()
+			return status
+		} else {
+			status := httpStatusCache.Status[port]
+			httpStatusCache.RWMutex.Unlock()
+			return status
+		}
 	}
+	status := httpStatusCache.Status[port]
+	httpStatusCache.RWMutex.RUnlock()
+	return status
 }
 
 // 带缓存的UDP端口存活检测（仍以fd存在为准）
 func getPortUDPStatus(port int, exist int) int {
-	udpStatusCache.Mutex.Lock()
-	defer udpStatusCache.Mutex.Unlock()
+	udpStatusCache.RWMutex.RLock()
 	now := time.Now()
-	if t, ok := udpStatusCache.LastCheck[port]; !ok || now.Sub(t) > udpStatusInterval {
-		udpStatusCache.Status[port] = exist
-		udpStatusCache.LastCheck[port] = now
-		return exist
-	} else {
-		return udpStatusCache.Status[port]
+	t, ok := udpStatusCache.LastCheck[port]
+	if !ok || now.Sub(t) > udpStatusInterval {
+		udpStatusCache.RWMutex.RUnlock()
+		udpStatusCache.RWMutex.Lock()
+		t, ok = udpStatusCache.LastCheck[port]
+		if !ok || now.Sub(t) > udpStatusInterval {
+			udpStatusCache.Status[port] = exist
+			udpStatusCache.LastCheck[port] = now
+			udpStatusCache.RWMutex.Unlock()
+			return exist
+		} else {
+			status := udpStatusCache.Status[port]
+			udpStatusCache.RWMutex.Unlock()
+			return status
+		}
 	}
+	status := udpStatusCache.Status[port]
+	udpStatusCache.RWMutex.RUnlock()
+	return status
 }
 
 // 自动清理所有端口相关缓存（只保留当前活跃端口）
@@ -773,7 +810,7 @@ func cleanStalePortCaches(infos []PortProcessInfo) {
 	}
 	httpAliveHistory.Unlock()
 	// 清理 portStatusCache
-	portStatusCache.Mutex.Lock()
+	portStatusCache.RWMutex.Lock()
 	for port := range portStatusCache.Status {
 		if !activePorts[port] {
 			delete(portStatusCache.Status, port)
@@ -781,50 +818,61 @@ func cleanStalePortCaches(infos []PortProcessInfo) {
 			delete(portStatusCache.LastCheck, port)
 		}
 	}
-	portStatusCache.Mutex.Unlock()
+	portStatusCache.RWMutex.Unlock()
 	// 清理 udpStatusCache
-	udpStatusCache.Mutex.Lock()
+	udpStatusCache.RWMutex.Lock()
 	for port := range udpStatusCache.Status {
 		if !activePorts[port] {
 			delete(udpStatusCache.Status, port)
 			delete(udpStatusCache.LastCheck, port)
 		}
 	}
-	udpStatusCache.Mutex.Unlock()
+	udpStatusCache.RWMutex.Unlock()
 	// 清理 httpStatusCache
-	httpStatusCache.Mutex.Lock()
+	httpStatusCache.RWMutex.Lock()
 	for port := range httpStatusCache.Status {
 		if !activePorts[port] {
 			delete(httpStatusCache.Status, port)
 			delete(httpStatusCache.LastCheck, port)
 		}
 	}
-	httpStatusCache.Mutex.Unlock()
+	httpStatusCache.RWMutex.Unlock()
 	// 清理进程存活缓存
-	processAliveCache.Mutex.Lock()
+	processAliveCache.RWMutex.Lock()
 	for key := range processAliveCache.Status {
 		if !activePidKeys[key] {
 			delete(processAliveCache.Status, key)
 			delete(processAliveCache.LastCheck, key)
 		}
 	}
-	processAliveCache.Mutex.Unlock()
+	processAliveCache.RWMutex.Unlock()
 }
 
 // 带缓存的进程存活检测
 func getProcessAliveStatus(pid int) int {
 	key := getPidKey(pid)
-	processAliveCache.Mutex.Lock()
-	defer processAliveCache.Mutex.Unlock()
+	processAliveCache.RWMutex.RLock()
 	now := time.Now()
-	if t, ok := processAliveCache.LastCheck[key]; !ok || now.Sub(t) > processAliveStatusInterval {
-		status := checkProcess(pid)
-		processAliveCache.Status[key] = status
-		processAliveCache.LastCheck[key] = now
-		return status
-	} else {
-		return processAliveCache.Status[key]
+	t, ok := processAliveCache.LastCheck[key]
+	if !ok || now.Sub(t) > processAliveStatusInterval {
+		processAliveCache.RWMutex.RUnlock()
+		processAliveCache.RWMutex.Lock()
+		t, ok = processAliveCache.LastCheck[key]
+		if !ok || now.Sub(t) > processAliveStatusInterval {
+			status := checkProcess(pid)
+			processAliveCache.Status[key] = status
+			processAliveCache.LastCheck[key] = now
+			processAliveCache.RWMutex.Unlock()
+			return status
+		} else {
+			status := processAliveCache.Status[key]
+			processAliveCache.RWMutex.Unlock()
+			return status
+		}
 	}
+	status := processAliveCache.Status[key]
+	processAliveCache.RWMutex.RUnlock()
+	return status
 }
 
 // getPidKey 生成进程缓存唯一key（pid+starttime）
