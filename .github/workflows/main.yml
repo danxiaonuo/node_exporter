@@ -58,8 +58,8 @@ jobs:
         with:
           name: node_exporter-binaries
           path: |
-            node_exporter/node_exporter-linux-amd64
-            node_exporter/node_exporter-linux-arm64
+            node_exporter/.build/linux-amd64/node_exporter
+            node_exporter/.build/linux-arm64/node_exporter
 
       - name: 设置 QEMU（支持多平台 Docker 构建）
         uses: docker/setup-qemu-action@v3
