@@ -28,17 +28,37 @@ type PortProcessInfo struct {
 }
 
 // portProcessCacheStruct 结构体：用于缓存端口与进程的发现结果，减少频繁扫描带来的系统负载
-// LastScan 记录上次扫描时间，Data 存储扫描结果，Mutex 用于并发保护
+// LastScan 记录上次扫描时间，Data 存储扫描结果，RWMutex 用于并发保护
 type portProcessCacheStruct struct {
 	LastScan time.Time
 	Data     []PortProcessInfo
-	Mutex    sync.Mutex
+	RWMutex  sync.RWMutex
 }
 
 var portProcessCache = &portProcessCacheStruct{}
 
 // 扫描周期，单位为小时。每8小时自动重新扫描一次端口和进程列表
 const scanInterval = 8 * time.Hour
+
+var procPrefix = func() string {
+	if p := os.Getenv("PROC_PREFIX"); p != "" {
+		return p
+	}
+	// 自动判断容器环境
+	cgroupFile := "/proc/1/cgroup"
+	content, err := os.ReadFile(cgroupFile)
+	if err == nil {
+		s := string(content)
+		if strings.Contains(s, "docker") || strings.Contains(s, "kubepods") {
+			return "/host/proc"
+		}
+	}
+	return ""
+}()
+
+func procPath(path string) string {
+	return procPrefix + path
+}
 
 // PortProcessCollector 结构体：实现 Prometheus Collector 接口
 // 用于采集端口存活、进程存活、端口响应时间等指标
@@ -53,7 +73,7 @@ type PortProcessCollector struct {
 
 // NewPortProcessCollector 构造函数：创建并返回一个新的端口进程采集器
 func NewPortProcessCollector() *PortProcessCollector {
-	labels := []string{"process_name", "exe_path", "port", "pid"}
+	labels := []string{"process_name", "exe_path", "port"}
 	return &PortProcessCollector{
 		portTCPAliveDesc: prometheus.NewDesc(
 			"node_tcp_port_alive",
@@ -78,7 +98,7 @@ func NewPortProcessCollector() *PortProcessCollector {
 		processAliveDesc: prometheus.NewDesc(
 			"node_process_alive",
 			"Process alive status (1=alive, 0=dead)",
-			[]string{"process_name", "exe_path", "pid"}, nil,
+			[]string{"process_name", "exe_path"}, nil,
 		),
 	}
 }
@@ -97,34 +117,39 @@ func (c *PortProcessCollector) Describe(ch chan<- *prometheus.Desc) {
 func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 	infos := getPortProcessInfo()      // 获取端口与进程列表（8小时刷新一次）
 	reportedPids := make(map[int]bool) // 记录已上报的进程，避免重复
+	tcpPortDone := make(map[int]bool)
+	udpPortDone := make(map[int]bool)
 	for _, info := range infos {
-		labels := []string{info.ProcessName, info.ExePath, strconv.Itoa(info.Port), strconv.Itoa(info.Pid)}
+		labels := []string{info.ProcessName, info.ExePath, strconv.Itoa(info.Port)}
 		if info.Protocol == "tcp" {
-			// 检查TCP端口存活与连接耗时
-			alive, respTime := checkPortTCP(info.Port)
-			ch <- prometheus.MustNewConstMetric(
-				c.portTCPAliveDesc, prometheus.GaugeValue, float64(alive), labels...,
-			)
-			ch <- prometheus.MustNewConstMetric(
-				c.portTCPRespDesc, prometheus.GaugeValue, respTime, labels...,
-			)
-			// 检查HTTP服务可用性
-			httpAlive := checkPortHTTP(info.Port)
-			ch <- prometheus.MustNewConstMetric(
-				c.httpAliveDesc, prometheus.GaugeValue, float64(httpAlive), labels...,
-			)
+			if !tcpPortDone[info.Port] {
+				alive, respTime := checkPortTCP(info.Port)
+				ch <- prometheus.MustNewConstMetric(
+					c.portTCPAliveDesc, prometheus.GaugeValue, float64(alive), labels...,
+				)
+				ch <- prometheus.MustNewConstMetric(
+					c.portTCPRespDesc, prometheus.GaugeValue, respTime, labels...,
+				)
+				httpAlive := checkPortHTTP(info.Port)
+				ch <- prometheus.MustNewConstMetric(
+					c.httpAliveDesc, prometheus.GaugeValue, float64(httpAlive), labels...,
+				)
+				tcpPortDone[info.Port] = true
+			}
 		} else if info.Protocol == "udp" {
-			// UDP端口只采集存在性
-			ch <- prometheus.MustNewConstMetric(
-				c.portUDPAliveDesc, prometheus.GaugeValue, 1, labels...,
-			)
+			if !udpPortDone[info.Port] {
+				ch <- prometheus.MustNewConstMetric(
+					c.portUDPAliveDesc, prometheus.GaugeValue, 1, labels...,
+				)
+				udpPortDone[info.Port] = true
+			}
 		}
 		// 进程存活指标去重：每个唯一pid只采集一次
 		if !reportedPids[info.Pid] {
 			procAlive := checkProcess(info.Pid)
 			ch <- prometheus.MustNewConstMetric(
 				c.processAliveDesc, prometheus.GaugeValue, float64(procAlive),
-				info.ProcessName, info.ExePath, strconv.Itoa(info.Pid),
+				info.ProcessName, info.ExePath,
 			)
 			reportedPids[info.Pid] = true
 		}
@@ -134,29 +159,39 @@ func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 // getPortProcessInfo 函数：获取端口与进程信息，带缓存机制
 // 仅在缓存过期（8小时）或首次运行时重新扫描，其他时间直接返回缓存结果
 func getPortProcessInfo() []PortProcessInfo {
-	portProcessCache.Mutex.Lock()
-	defer portProcessCache.Mutex.Unlock()
-	if time.Since(portProcessCache.LastScan) > scanInterval || len(portProcessCache.Data) == 0 {
-		portProcessCache.Data = discoverPortProcess()
-		portProcessCache.LastScan = time.Now()
+	portProcessCache.RWMutex.RLock()
+	expired := time.Since(portProcessCache.LastScan) > scanInterval || len(portProcessCache.Data) == 0
+	portProcessCache.RWMutex.RUnlock()
+	if expired {
+		portProcessCache.RWMutex.Lock()
+		// 再次检查，防止并发下重复扫描
+		if time.Since(portProcessCache.LastScan) > scanInterval || len(portProcessCache.Data) == 0 {
+			portProcessCache.Data = discoverPortProcess()
+			portProcessCache.LastScan = time.Now()
+		}
+		portProcessCache.RWMutex.Unlock()
 	}
+	portProcessCache.RWMutex.RLock()
+	defer portProcessCache.RWMutex.RUnlock()
 	return portProcessCache.Data
 }
 
-// discoverPortProcess 函数：自动发现主机上所有监听TCP和UDP端口及其关联进程
-// TCP/UDP端口分别去重（同一协议下同一端口只采集一次）
-// 排除指定的系统和常见守护进程
+// discoverPortProcess 函数：优化端口发现效率，先建立 inode->port 映射，再遍历进程 fd 查找 socket inode
 func discoverPortProcess() []PortProcessInfo {
 	var results []PortProcessInfo
-	portSeenTCP := make(map[int]bool) // TCP端口去重map
-	portSeenUDP := make(map[int]bool) // UDP端口去重map
-	procDir, err := os.Open("/proc")
+	tcpInodePort := parseInodePortMap([]string{"/proc/net/tcp", "/proc/net/tcp6"}, "tcp")
+	udpInodePort := parseInodePortMap([]string{"/proc/net/udp", "/proc/net/udp6"}, "udp")
+	seenTCP := make(map[int]bool) // 端口唯一
+	seenUDP := make(map[int]bool)
+	procDir, err := os.Open(procPath("/proc"))
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "[port_process_collector] failed to open /proc: %v\n", err)
 		return results
 	}
 	defer procDir.Close()
 	entries, err := procDir.Readdir(-1)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "[port_process_collector] failed to read /proc: %v\n", err)
 		return results
 	}
 	for _, entry := range entries {
@@ -167,53 +202,62 @@ func discoverPortProcess() []PortProcessInfo {
 		if err != nil {
 			continue
 		}
-		fdPath := fmt.Sprintf("/proc/%d/fd", pid)
+		fdPath := procPath(fmt.Sprintf("/proc/%d/fd", pid))
 		fds, err := os.ReadDir(fdPath)
 		if err != nil {
+			fmt.Fprintf(os.Stderr, "[port_process_collector] failed to read %s: %v\n", fdPath, err)
 			continue
 		}
 		for _, fdEntry := range fds {
 			fdLink := fmt.Sprintf("%s/%s", fdPath, fdEntry.Name())
 			link, err := os.Readlink(fdLink)
-			if err != nil || !strings.HasPrefix(link, "socket:[") {
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[port_process_collector] failed to readlink %s: %v\n", fdLink, err)
+				continue
+			}
+			if !strings.HasPrefix(link, "socket:[") {
 				continue
 			}
 			inode := link[8 : len(link)-1]
 			// TCP
-			port := findPortByInode(inode, "tcp")
-			if port != 0 && !portSeenTCP[port] {
-				portSeenTCP[port] = true
+			if port, ok := tcpInodePort[inode]; ok {
+				if seenTCP[port] {
+					continue
+				}
+				seenTCP[port] = true
 				exePath := getProcessExe(pid)
 				exeName := filepath.Base(exePath)
 				if isExcludedProcess(exeName) {
-					continue // 排除指定进程
+					continue
 				}
 				results = append(results, PortProcessInfo{
-					ProcessName: exeName,
-					ExePath:     exePath,
+					ProcessName: safeLabel(exeName),
+					ExePath:     safeLabel(exePath),
 					Port:        port,
 					Pid:         pid,
-					WorkDir:     getProcessCwd(pid),
-					Username:    getProcessUser(pid),
+					WorkDir:     safeLabel(getProcessCwd(pid)),
+					Username:    safeLabel(getProcessUser(pid)),
 					Protocol:    "tcp",
 				})
 			}
 			// UDP
-			port = findPortByInode(inode, "udp")
-			if port != 0 && !portSeenUDP[port] {
-				portSeenUDP[port] = true
+			if port, ok := udpInodePort[inode]; ok {
+				if seenUDP[port] {
+					continue
+				}
+				seenUDP[port] = true
 				exePath := getProcessExe(pid)
 				exeName := filepath.Base(exePath)
 				if isExcludedProcess(exeName) {
-					continue // 排除指定进程
+					continue
 				}
 				results = append(results, PortProcessInfo{
-					ProcessName: exeName,
-					ExePath:     exePath,
+					ProcessName: safeLabel(exeName),
+					ExePath:     safeLabel(exePath),
 					Port:        port,
 					Pid:         pid,
-					WorkDir:     getProcessCwd(pid),
-					Username:    getProcessUser(pid),
+					WorkDir:     safeLabel(getProcessCwd(pid)),
+					Username:    safeLabel(getProcessUser(pid)),
 					Protocol:    "udp",
 				})
 			}
@@ -222,20 +266,13 @@ func discoverPortProcess() []PortProcessInfo {
 	return results
 }
 
-// findPortByInode 函数：通过 inode 查找端口号（支持 tcp/tcp6/udp/udp6）
-// 只采集 LISTEN 状态的TCP端口和所有UDP端口
-func findPortByInode(inode string, proto string) int {
-	var files []string
-	if proto == "tcp" {
-		files = []string{"/proc/net/tcp", "/proc/net/tcp6"}
-	} else if proto == "udp" {
-		files = []string{"/proc/net/udp", "/proc/net/udp6"}
-	} else {
-		return 0
-	}
+// parseInodePortMap 解析 /proc/net/tcp 或 udp，返回 inode->port 映射
+func parseInodePortMap(files []string, proto string) map[string]int {
+	result := make(map[string]int)
 	for _, file := range files {
-		content, err := os.ReadFile(file)
+		content, err := os.ReadFile(procPath(file))
 		if err != nil {
+			fmt.Fprintf(os.Stderr, "[port_process_collector] failed to read %s: %v\n", file, err)
 			continue
 		}
 		lines := strings.Split(string(content), "\n")
@@ -247,22 +284,20 @@ func findPortByInode(inode string, proto string) int {
 			if proto == "tcp" && fields[3] != "0A" {
 				continue // 只查TCP LISTEN
 			}
-			// UDP不判断状态
-			if fields[9] == inode {
-				addrParts := strings.Split(fields[1], ":")
-				if len(addrParts) < 2 {
-					continue
-				}
-				portHex := addrParts[len(addrParts)-1]
-				port, err := strconv.ParseInt(portHex, 16, 32)
-				if err != nil {
-					continue
-				}
-				return int(port)
+			inode := fields[9]
+			addrParts := strings.Split(fields[1], ":")
+			if len(addrParts) < 2 {
+				continue
 			}
+			portHex := addrParts[len(addrParts)-1]
+			port, err := strconv.ParseInt(portHex, 16, 32)
+			if err != nil {
+				continue
+			}
+			result[inode] = int(port)
 		}
 	}
-	return 0
+	return result
 }
 
 // checkPortTCP 函数：仅检测TCP端口存活状态和连接耗时（不做HTTP请求）
@@ -294,7 +329,7 @@ func checkPortHTTP(port int) int {
 // checkProcess 函数：检测进程是否存活
 // 只要 /proc/<pid> 目录存在即认为进程存活
 func checkProcess(pid int) int {
-	if _, err := os.Stat(fmt.Sprintf("/proc/%d", pid)); err == nil {
+	if _, err := os.Stat(procPath(fmt.Sprintf("/proc/%d", pid))); err == nil {
 		return 1
 	}
 	return 0
@@ -302,17 +337,17 @@ func checkProcess(pid int) int {
 
 // getProcessExe 函数：获取进程的可执行文件路径
 func getProcessExe(pid int) string {
-	path, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
-	if err != nil {
-		return ""
+	path, err := os.Readlink(procPath(fmt.Sprintf("/proc/%d/exe", pid)))
+	if err != nil || path == "" {
+		return "/"
 	}
 	return path
 }
 
 // getProcessCwd 函数：获取进程的工作目录
 func getProcessCwd(pid int) string {
-	path, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", pid))
-	if err != nil {
+	path, err := os.Readlink(procPath(fmt.Sprintf("/proc/%d/cwd", pid)))
+	if err != nil || path == "" {
 		return "/"
 	}
 	return path
@@ -320,20 +355,28 @@ func getProcessCwd(pid int) string {
 
 // getProcessUser 函数：获取进程的运行用户（UID）
 func getProcessUser(pid int) string {
-	content, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	content, err := os.ReadFile(procPath(fmt.Sprintf("/proc/%d/status", pid)))
 	if err != nil {
-		return ""
+		return "/"
 	}
 	lines := strings.Split(string(content), "\n")
 	for _, line := range lines {
 		if strings.HasPrefix(line, "Uid:") {
 			fields := strings.Fields(line)
-			if len(fields) >= 2 {
+			if len(fields) >= 2 && fields[1] != "" {
 				return fields[1]
 			}
 		}
 	}
-	return ""
+	return "/"
+}
+
+// safeLabel 保证 Prometheus 标签不为空，若为空则返回 "/"
+func safeLabel(val string) string {
+	if strings.TrimSpace(val) == "" {
+		return "/"
+	}
+	return val
 }
 
 // isExcludedProcess 函数：判断进程名是否在排除列表中
