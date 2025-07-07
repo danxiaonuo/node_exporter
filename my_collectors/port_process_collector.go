@@ -392,8 +392,8 @@ func safeLabel(val string) string {
 func isExcludedProcess(exeName string) bool {
 	excluded := []string{
 		"systemd", "init", "kthreadd", "ksoftirqd", "rcu_sched", "rcu_bh", "bo-agent",
-		"migration", "watchdog", "cpuhp", "netns", "khungtaskd", "oom_reaper",
-		"kswapd", "fsnotify_mark", "ecryptfs-kthrea", "kauditd", "khubd", "ssh",
+		"migration", "watchdog", "cpuhp", "netns", "khungtaskd", "oom_reaper", "chronyd",
+		"kswapd", "fsnotify_mark", "ecryptfs-kthrea", "kauditd", "khubd", "ssh", "snmpd",
 		"zabbix", "prometheus", "rpcbind", "smartdns", "cupsd", "dhclient", "master",
 		"rpc.statd", "titanagent", "node_exporter", "monitor_manage", "dnsmasq",
 	}
