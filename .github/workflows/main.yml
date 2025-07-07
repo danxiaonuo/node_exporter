@@ -90,13 +90,21 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GHCR_TOKEN }}
 
-      - name: 构建并推送 Docker 镜像到 DockerHub 和 ghcr.io
-        uses: docker/build-push-action@v6
-        with:
-          file: 'node_exporter/Dockerfile'
-          platforms: linux/amd64,linux/arm64
-          context: ./node_exporter
-          push: true
-          tags: |
-            ${{ github.repository_owner }}/node_exporter:latest
-            ghcr.io/${{ github.repository_owner }}/node_exporter:latest 
+      - name: 构建并推送 amd64 镜像
+        run: |
+          docker buildx build --platform linux/amd64 --build-arg ARCH=amd64 --build-arg OS=linux -f node_exporter/Dockerfile -t ${{ github.repository_owner }}/node_exporter:amd64 -t ghcr.io/${{ github.repository_owner }}/node_exporter:amd64 --push ./node_exporter
+
+      - name: 构建并推送 arm64 镜像
+        run: |
+          docker buildx build --platform linux/arm64 --build-arg ARCH=arm64 --build-arg OS=linux -f node_exporter/Dockerfile -t ${{ github.repository_owner }}/node_exporter:arm64 -t ghcr.io/${{ github.repository_owner }}/node_exporter:arm64 --push ./node_exporter
+
+      - name: 合并并推送多平台镜像 manifest
+        run: |
+          docker manifest create ${{ github.repository_owner }}/node_exporter:latest \
+            ${{ github.repository_owner }}/node_exporter:amd64 \
+            ${{ github.repository_owner }}/node_exporter:arm64
+          docker manifest push ${{ github.repository_owner }}/node_exporter:latest
+          docker manifest create ghcr.io/${{ github.repository_owner }}/node_exporter:latest \
+            ghcr.io/${{ github.repository_owner }}/node_exporter:amd64 \
+            ghcr.io/${{ github.repository_owner }}/node_exporter:arm64
+          docker manifest push ghcr.io/${{ github.repository_owner }}/node_exporter:latest 
