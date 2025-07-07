@@ -1,0 +1,49 @@
+name: '子模块自动同步'
+
+on:
+  # 手动触发工作流
+  workflow_dispatch:
+    inputs:
+      build:
+        description: '执行子模块同步'
+        required: true
+        default: 'build Sync'
+  # 定时触发（每6小时）
+  schedule:
+     - cron: '* */6 * * *'
+  # 点Star触发
+  watch:  
+     types: [started]
+
+jobs:
+  sync:
+    name: '子模块自动同步'
+    runs-on: ubuntu-latest
+    if: github.event.repository.owner.id == github.event.sender.id || ! github.event.sender.id
+
+    # 所有 shell 命令均使用 bash
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+    # 第一步：检出主仓库和所有子模块代码
+    - name: 检出代码（包含子模块）
+      uses: actions/checkout@v3
+      with:
+        token: ${{ secrets.CI_TOKEN }}
+        submodules: true
+
+    # 第二步：同步主仓库和子模块到最新
+    - name: 同步子模块到最新
+      run: |
+        git pull --recurse-submodules
+        git submodule update --remote --recursive
+
+    # 第三步：自动提交并推送同步结果
+    - name: 自动提交并推送
+      run: |
+        git config --global user.name 'Git bot'
+        git config --global user.email 'bot@noreply.github.com'
+        git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
+        git commit -am "Auto updated submodule references" && git push || echo "无变更，无需提交" 
