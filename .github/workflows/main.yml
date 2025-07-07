@@ -48,8 +48,9 @@ jobs:
       - name: 构建多平台二进制文件
         run: |
           cd node_exporter
-          GOOS=linux   GOARCH=amd64  go build -o node_exporter-linux-amd64
-          GOOS=linux   GOARCH=arm64  go build -o node_exporter-linux-arm64
+          mkdir -p .build/linux-amd64 .build/linux-arm64
+          GOOS=linux   GOARCH=amd64  go build -o .build/linux-amd64/node_exporter
+          GOOS=linux   GOARCH=arm64  go build -o .build/linux-arm64/node_exporter
 
       # 上传所有平台的二进制文件到 GitHub Actions 构建产物区
       - name: 上传多平台二进制文件
