@@ -251,6 +251,7 @@ docker run --rm \
   --privileged \
   -v /proc:/host/proc:ro \
   -e PROC_PREFIX=/host/proc \
+  -e EXCLUDED_PROCESS_NAMES=nginx,redis,customapp \
   --user root \
   your_image_name
 ```
@@ -258,6 +259,7 @@ docker run --rm \
 - `--privileged`：容器拥有所有宿主机能力，能访问 /proc 下所有进程。
 - `-v /proc:/host/proc:ro`：挂载宿主机 /proc 到容器内 /host/proc。
 - `-e PROC_PREFIX=/host/proc`：让采集器访问宿主机 /proc。
+- `-e EXCLUDED_PROCESS_NAMES=nginx,redis,customapp`：传入要排除的进程名。
 - `--user root`：以 root 用户运行，避免权限不足。
 
 #### 2. docker-compose 示例
@@ -272,6 +274,7 @@ services:
       - /proc:/host/proc:ro
     environment:
       - PROC_PREFIX=/host/proc
+      - EXCLUDED_PROCESS_NAMES=nginx,redis,customapp
     restart: always
 ```
 
@@ -299,6 +302,8 @@ spec:
       env:
         - name: PROC_PREFIX
           value: /host/proc
+        - name: EXCLUDED_PROCESS_NAMES
+          value: nginx,redis,customapp
   volumes:
     - name: proc
       hostPath:
@@ -330,6 +335,8 @@ spec:
           env:
             - name: PROC_PREFIX
               value: /host/proc
+            - name: EXCLUDED_PROCESS_NAMES
+              value: nginx,redis,customapp
       volumes:
         - name: proc
           hostPath:
@@ -342,3 +349,53 @@ spec:
 - 容器内如需采集宿主机进程/端口，必须以 root 用户、特权模式运行，并挂载宿主机 /proc。
 - 如果宿主机 /proc 挂载了 hidepid=1/2，则即使 root 也无法访问其他用户进程的 fd，需宿主机 /proc 为 hidepid=0。
 - 生产环境下，特权容器有安全风险，请根据实际需求权衡。
+
+## 进程排除自定义说明
+
+本插件支持通过环境变量 `EXCLUDED_PROCESS_NAMES`（逗号分隔）自定义排除进程名，容器和 K8s 环境可灵活配置。
+
+- 默认排除列表内置常见系统和监控进程。
+- 通过 `EXCLUDED_PROCESS_NAMES` 传入的进程名会与默认排除列表合并。
+- 匹配方式为"包含关系"，如 `nginx` 会排除所有包含 `nginx` 的进程名。
+
+### 用法示例
+
+**Docker 运行：**
+
+```sh
+docker run --rm \
+  --privileged \
+  -v /proc:/host/proc:ro \
+  -e PROC_PREFIX=/host/proc \
+  -e EXCLUDED_PROCESS_NAMES=nginx,redis,customapp \
+  --user root \
+  your_image_name
+```
+
+**docker-compose 示例：**
+
+```yaml
+services:
+  node_exporter:
+    image: your_image_name
+    privileged: true
+    user: root
+    volumes:
+      - /proc:/host/proc:ro
+    environment:
+      - PROC_PREFIX=/host/proc
+      - EXCLUDED_PROCESS_NAMES=nginx,redis,customapp
+    restart: always
+```
+
+**Kubernetes 示例（Pod/DaemonSet）：**
+
+```yaml
+env:
+  - name: PROC_PREFIX
+    value: /host/proc
+  - name: EXCLUDED_PROCESS_NAMES
+    value: nginx,redis,customapp
+```
+
+这样配置后，所有进程名包含 `nginx`、`redis`、`customapp` 的进程都会被排除，不会被采集。

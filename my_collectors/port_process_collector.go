@@ -387,17 +387,31 @@ func safeLabel(val string) string {
 	return val
 }
 
-// isExcludedProcess 函数：判断进程名是否在排除列表中
-// 用于过滤掉系统进程、监控进程等不需要采集的进程
+var excludedProcessNames = func() []string {
+	env := os.Getenv("EXCLUDED_PROCESS_NAMES")
+	if env == "" {
+		return nil
+	}
+	var result []string
+	for _, name := range strings.Split(env, ",") {
+		n := strings.TrimSpace(name)
+		if n != "" {
+			result = append(result, n)
+		}
+	}
+	return result
+}()
+
 func isExcludedProcess(exeName string) bool {
-	excluded := []string{
+	defaultExcluded := []string{
 		"systemd", "init", "kthreadd", "ksoftirqd", "rcu_sched", "rcu_bh", "bo-agent",
 		"migration", "watchdog", "cpuhp", "netns", "khungtaskd", "oom_reaper", "chronyd",
 		"kswapd", "fsnotify_mark", "ecryptfs-kthrea", "kauditd", "khubd", "ssh", "snmpd",
 		"zabbix", "prometheus", "rpcbind", "smartdns", "cupsd", "dhclient", "master",
 		"rpc.statd", "titanagent", "node_exporter", "monitor_manage", "dnsmasq",
 	}
-	for _, name := range excluded {
+	all := append(defaultExcluded, excludedProcessNames...)
+	for _, name := range all {
 		if strings.Contains(exeName, name) {
 			return true
 		}
