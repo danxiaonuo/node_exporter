@@ -1,4 +1,4 @@
-name: 自动编译
+name: 编译 node_exporter 插件
 
 on:
   repository_dispatch:
