@@ -18,6 +18,10 @@ on:
   watch:
     types: [started]
 
+permissions:
+  contents: write
+  actions: write
+
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
@@ -30,9 +34,9 @@ jobs:
           submodules: true
 
       - name: 设置 Go 环境
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: 'stable'
 
       - name: 缓存 Go modules
         uses: actions/cache@v4
@@ -103,3 +107,34 @@ jobs:
           tags: |
             ${{ github.repository_owner }}/node_exporter:latest
             ghcr.io/${{ github.repository_owner }}/node_exporter:latest 
+
+      - name: 重命名产物以避免同名
+        run: |
+          mv node_exporter/.build/linux-amd64/node_exporter node_exporter/.build/linux-amd64/node_exporter-linux-amd64
+          mv node_exporter/.build/linux-arm64/node_exporter node_exporter/.build/linux-arm64/node_exporter-linux-arm64
+
+      - name: 发布到 GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest Release
+          files: |
+            node_exporter/.build/linux-amd64/node_exporter-linux-amd64
+            node_exporter/.build/linux-arm64/node_exporter-linux-arm64
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 清理旧 Releases
+        uses: dev-drprasad/delete-older-releases@v0.3.3
+        with:
+          keep_latest: 1
+          delete_tags: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 清理旧的 workflow artifacts
+        uses: c-hive/gha-remove-artifacts@v1
+        with:
+          age: '1min'
+          skip-recent: 1
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 

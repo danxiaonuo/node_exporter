@@ -29,7 +29,7 @@ jobs:
     steps:
     # 第一步：检出主仓库和所有子模块代码
     - name: 检出代码（包含子模块）
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
       with:
         token: ${{ secrets.CI_TOKEN }}
         submodules: true
