@@ -33,26 +33,8 @@ jobs:
         with:
           submodules: true
 
-      - name: 设置 Go 环境
-        uses: actions/setup-go@v5
-        with:
-          go-version: 'stable'
-
-      - name: 缓存 Go modules
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
-
-      - name: 自动注册自定义采集器
-        run: |
-          bash my_collectors/auto_register_collectors.sh
-
       - name: 设置版本信息环境变量
+        working-directory: node_exporter
         run: |
           echo "VERSION=$(git describe --tags --always || echo dev)" >> $GITHUB_ENV
           echo "REVISION=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
@@ -63,11 +45,10 @@ jobs:
       # 多平台二进制文件编译
       - name: 构建多平台二进制文件（静态编译）
         run: |
-          cd node_exporter
           go mod tidy
-          mkdir -p .build/linux-amd64 .build/linux-arm64
-          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64  go build -ldflags "-X github.com/prometheus/common/version.Version=${VERSION} -X github.com/prometheus/common/version.Revision=${REVISION} -X github.com/prometheus/common/version.Branch=${BRANCH} -X github.com/prometheus/common/version.BuildUser=${BUILDUSER} -X github.com/prometheus/common/version.BuildDate=${BUILDDATE}" -o .build/linux-amd64/node_exporter
-          CGO_ENABLED=0 GOOS=linux   GOARCH=arm64  go build -ldflags "-X github.com/prometheus/common/version.Version=${VERSION} -X github.com/prometheus/common/version.Revision=${REVISION} -X github.com/prometheus/common/version.Branch=${BRANCH} -X github.com/prometheus/common/version.BuildUser=${BUILDUSER} -X github.com/prometheus/common/version.BuildDate=${BUILDDATE}" -o .build/linux-arm64/node_exporter
+          mkdir -p node_exporter/.build/linux-amd64 node_exporter/.build/linux-arm64
+          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64  go build -C node_exporter -ldflags "-X github.com/prometheus/common/version.Version=${VERSION} -X github.com/prometheus/common/version.Revision=${REVISION} -X github.com/prometheus/common/version.Branch=${BRANCH} -X github.com/prometheus/common/version.BuildUser=${BUILDUSER} -X github.com/prometheus/common/version.BuildDate=${BUILDDATE}" -o .build/linux-amd64/node_exporter
+          CGO_ENABLED=0 GOOS=linux   GOARCH=arm64  go build -C node_exporter -ldflags "-X github.com/prometheus/common/version.Version=${VERSION} -X github.com/prometheus/common/version.Revision=${REVISION} -X github.com/prometheus/common/version.Branch=${BRANCH} -X github.com/prometheus/common/version.BuildUser=${BUILDUSER} -X github.com/prometheus/common/version.BuildDate=${BUILDDATE}" -o .build/linux-arm64/node_exporter
 
       # 上传所有平台的二进制文件到 GitHub Actions 构建产物区
       - name: 上传多平台二进制文件
