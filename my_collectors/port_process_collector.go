@@ -603,13 +603,17 @@ func parseInodePortMap(files []string, proto string) map[string]int {
 // 4. 检测超时时间可通过PORT_CHECK_TIMEOUT配置，默认1分钟
 // 返回值：alive（1=存活，0=不可用），respTime（TCP连接耗时，秒）
 func checkPortTCP(port int) (alive int, respTime float64) {
+	return checkPortTCPWithTimeout(port, portCheckTimeout)
+}
+
+func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTime float64) {
 	commonAddrs := []string{"127.0.0.1", "0.0.0.0", "::1", "::"}
 	minResp := -1.0 // 检测失败时返回-1
 	found := false
 	// 先检测常用地址
 	for _, ip := range commonAddrs {
 		start := time.Now()
-		conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, strconv.Itoa(port)), portCheckTimeout)
+		conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, strconv.Itoa(port)), timeout)
 		cost := time.Since(start).Seconds()
 		if err == nil {
 			conn.Close()
@@ -645,7 +649,7 @@ func checkPortTCP(port int) (alive int, respTime float64) {
 	if len(addrs) == 0 {
 		return 0, 0
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), portCheckTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	resultCh := make(chan float64, len(addrs))
 	sem := make(chan struct{}, maxParallelIPChecks)
@@ -662,7 +666,7 @@ func checkPortTCP(port int) (alive int, respTime float64) {
 			default:
 			}
 			start := time.Now()
-			conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, strconv.Itoa(port)), portCheckTimeout)
+			conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, strconv.Itoa(port)), timeout)
 			cost := time.Since(start).Seconds()
 			if err == nil {
 				conn.Close()
@@ -692,8 +696,12 @@ func checkPortTCP(port int) (alive int, respTime float64) {
 // 4. 检测超时时间可通过PORT_CHECK_TIMEOUT配置，默认1分钟
 // 返回值：1=HTTP服务可访问，0=不可访问
 func checkPortHTTP(port int) int {
+	return checkPortHTTPWithTimeout(port, portCheckTimeout)
+}
+
+func checkPortHTTPWithTimeout(port int, timeout time.Duration) int {
 	commonAddrs := []string{"127.0.0.1", "0.0.0.0", "::1", "::"}
-	client := &http.Client{Timeout: portCheckTimeout}
+	client := &http.Client{Timeout: timeout}
 	// 先检测常用地址
 	for _, ip := range commonAddrs {
 		url := "http://[" + ip + "]:" + strconv.Itoa(port)
@@ -736,7 +744,7 @@ func checkPortHTTP(port int) int {
 	if len(addrs) == 0 {
 		return 0
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), portCheckTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	resultCh := make(chan struct{}, len(addrs))
 	sem := make(chan struct{}, maxParallelIPChecks)
@@ -893,10 +901,7 @@ func getPortStatus(port int) (alive int, respTime float64) {
 			// 快速模式下使用更短的超时时间
 			if fastMode {
 				// 在快速模式下，使用更短的超时时间进行检测
-				originalTimeout := portCheckTimeout
-				portCheckTimeout = 500 * time.Millisecond
-				alive, respTime = checkPortTCP(port)
-				portCheckTimeout = originalTimeout
+				alive, respTime = checkPortTCPWithTimeout(port, 500*time.Millisecond)
 			} else {
 				alive, respTime = checkPortTCP(port)
 			}
