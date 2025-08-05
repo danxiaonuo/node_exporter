@@ -76,7 +76,9 @@ node_http_port_alive{process_name="nginx", exe_path="/usr/sbin/nginx", port="80"
 ```
 - 1 表示HTTP服务可访问（有响应头），0 表示HTTP服务不可用或假死。
 - **异步检测机制**：HTTP检测在后台异步进行，不阻塞指标暴露，首次访问时可能无HTTP指标。
-- **全量端口覆盖**：对所有TCP端口进行HTTP检测，不限于常见端口。
+- **智能检测策略**：
+  - **首次全量检测**：程序启动后对所有TCP端口进行HTTP检测，发现所有HTTP服务
+  - **后续精准检测**：只对曾经HTTP检测成功的端口进行持续检测，避免无意义检测
 - **智能缓存**：检测结果有缓存，刷新周期由 `PORT_HTTP_STATUS_INTERVAL` 控制。
 - **历史记录**：曾经HTTP检测通过的端口会持续暴露指标（即使后续检测失败）。
 - 支持IPv4和IPv6监听端口。
@@ -112,7 +114,7 @@ node_process_alive{process_name="nginx", exe_path="/usr/sbin/nginx"} 1
    - 每隔 `PORT_STATUS_INTERVAL`（默认1分钟）检测一次所有已发现TCP端口的存活状态和响应时间，结果有缓存。
    - `node_tcp_port_alive` 只检测TCP连接是否可达，支持IPv4/IPv6，超时/并发可配。
    - `node_tcp_port_response_seconds` 只反映TCP连接耗时。
-   - `node_http_port_alive` 检测HTTP服务可用性（异步检测，全量端口覆盖，不阻塞指标暴露，检测结果有缓存，支持IPv4/IPv6，超时/并发可配）。
+   - `node_http_port_alive` 检测HTTP服务可用性（智能检测策略：首次全量检测发现所有HTTP服务，后续只对成功端口进行持续检测，异步处理不阻塞指标暴露，检测结果有缓存，支持IPv4/IPv6，超时/并发可配）。
    - UDP端口只判断端口存在（进程fd存在），检测结果有缓存，周期可配置。
    - 进程检测只要 `/proc/<pid>` 存在即认为存活，检测结果有缓存，周期可配置。
 
@@ -145,6 +147,7 @@ node_process_alive{process_name="nginx", exe_path="/usr/sbin/nginx"} 1
   - 可在 `discoverPortProcess` 中增加白名单逻辑，或通过排除环境变量控制。
 - **Q: HTTP端口指标为什么有的端口不暴露？**
   - HTTP检测采用异步机制，首次访问时可能无HTTP指标，后续访问会逐步出现。
+  - 首次全量检测会尝试发现所有HTTP服务，后续只对成功端口进行持续检测。
   - 只有曾经HTTP检测通过的端口才会持续暴露该指标，且端口消失后指标消失。
 - **Q: 为什么会出现"broken pipe"错误？**
   - 通常是因为指标暴露速度过慢，客户端主动断开连接。

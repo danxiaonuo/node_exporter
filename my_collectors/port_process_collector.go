@@ -135,6 +135,12 @@ var httpDetectionQueue = struct {
 	done  chan struct{}
 }{ports: make(map[int]bool), done: make(chan struct{})}
 
+// 新增：记录是否已完成首次全量检测
+var firstScanCompleted = struct {
+	sync.RWMutex
+	done bool
+}{done: false}
+
 // 新增：HTTP检测异步处理器
 func startHTTPDetectionWorker() {
 	go func() {
@@ -177,6 +183,11 @@ func startHTTPDetectionWorker() {
 					}(port)
 				}
 				wg.Wait()
+
+				// 标记首次全量检测完成
+				firstScanCompleted.Lock()
+				firstScanCompleted.done = true
+				firstScanCompleted.Unlock()
 			}
 		}
 	}()
@@ -377,10 +388,30 @@ func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 							)
 						}
 					} else {
-						// 无缓存结果，加入异步检测队列
-						httpDetectionQueue.Lock()
-						httpDetectionQueue.ports[info.Port] = true
-						httpDetectionQueue.Unlock()
+						// 检查是否需要进行HTTP检测
+						shouldDetect := false
+
+						// 首次全量检测：对所有TCP端口进行HTTP检测
+						firstScanCompleted.RLock()
+						if !firstScanCompleted.done {
+							shouldDetect = true
+						}
+						firstScanCompleted.RUnlock()
+
+						// 后续检测：只对曾经HTTP成功的端口进行检测
+						if !shouldDetect {
+							httpAliveHistory.RLock()
+							everAlive := httpAliveHistory.Ports[info.Port]
+							httpAliveHistory.RUnlock()
+							shouldDetect = everAlive
+						}
+
+						if shouldDetect {
+							// 加入异步检测队列
+							httpDetectionQueue.Lock()
+							httpDetectionQueue.ports[info.Port] = true
+							httpDetectionQueue.Unlock()
+						}
 
 						// 检查历史记录，如果有过HTTP存活记录，先暴露0
 						httpAliveHistory.RLock()
