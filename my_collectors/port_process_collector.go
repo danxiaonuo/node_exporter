@@ -170,7 +170,9 @@ func startHTTPDetectionWorker() {
 						sem <- struct{}{}
 						defer func() { <-sem }()
 
+						log.Printf("[DEBUG] Worker开始检测端口 %d", p)
 						status := checkPortHTTP(p)
+						log.Printf("[DEBUG] Worker检测端口 %d 结果: %d", p, status)
 
 						httpStatusCache.RWMutex.Lock()
 						httpStatusCache.Status[p] = status
@@ -194,6 +196,8 @@ func startHTTPDetectionWorker() {
 						log.Printf("[DEBUG] 首次全量HTTP检测已完成")
 					}
 					firstScanCompleted.Unlock()
+				} else {
+					log.Printf("[DEBUG] Worker处理了 %d 个端口: %v", len(ports), ports)
 				}
 			}
 		}
