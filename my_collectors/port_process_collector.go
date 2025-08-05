@@ -141,13 +141,7 @@ var firstScanCompleted = struct {
 	done bool
 }{done: false}
 
-// 强制重置首次检测状态（用于调试）
-func resetFirstScan() {
-	firstScanCompleted.Lock()
-	firstScanCompleted.done = false
-	firstScanCompleted.Unlock()
-	log.Printf("[DEBUG] 强制重置首次检测状态")
-}
+
 
 // 新增：HTTP检测异步处理器
 func startHTTPDetectionWorker() {
@@ -178,9 +172,7 @@ func startHTTPDetectionWorker() {
 						sem <- struct{}{}
 						defer func() { <-sem }()
 
-						log.Printf("[DEBUG] Worker开始检测端口 %d", p)
 						status := checkPortHTTP(p)
-						log.Printf("[DEBUG] Worker检测端口 %d 结果: %d", p, status)
 
 						httpStatusCache.RWMutex.Lock()
 						httpStatusCache.Status[p] = status
@@ -201,12 +193,9 @@ func startHTTPDetectionWorker() {
 					firstScanCompleted.Lock()
 					if !firstScanCompleted.done {
 						firstScanCompleted.done = true
-						log.Printf("[DEBUG] 首次全量HTTP检测已完成")
 					}
 					firstScanCompleted.Unlock()
-				} else {
-					log.Printf("[DEBUG] Worker处理了 %d 个端口: %v", len(ports), ports)
-				}
+
 			}
 		}
 	}()
@@ -360,8 +349,6 @@ var processAliveCache = &processAliveCacheStruct{
 // Collect 方法：实现 Prometheus Collector 接口，采集所有指标
 // TCP/UDP端口分别采集，指标名区分，HTTP端口单独采集
 func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
-	// 强制重置首次检测状态，确保能进行检测
-	resetFirstScan()
 
 	infos := getPortProcessInfo()                // 获取端口与进程列表（8小时刷新一次）
 	reportedProcessKeys := make(map[string]bool) // 记录已上报的进程，避免重复（基于进程名+路径）
@@ -383,7 +370,6 @@ func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 
 				// HTTP检测优化：异步处理，智能过滤
 				if enableHTTPDetection {
-					log.Printf("[DEBUG] 端口 %d 开始HTTP检测逻辑", info.Port)
 					// 检查缓存中是否已有结果
 					httpStatusCache.RWMutex.RLock()
 					now := time.Now()
@@ -407,27 +393,22 @@ func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 							ch <- prometheus.MustNewConstMetric(
 								c.httpAliveDesc, prometheus.GaugeValue, 1, labels...,
 							)
-							log.Printf("[DEBUG] 端口 %d 暴露HTTP指标: 1", info.Port)
 						} else if everAlive {
 							ch <- prometheus.MustNewConstMetric(
 								c.httpAliveDesc, prometheus.GaugeValue, 0, labels...,
 							)
-							log.Printf("[DEBUG] 端口 %d 暴露HTTP指标: 0 (历史记录)", info.Port)
 						}
 					} else {
 						// 检查是否需要进行HTTP检测
 						shouldDetect := false
 
-						// 首次全量检测：对所有TCP端口进行HTTP检测
+												// 首次全量检测：对所有TCP端口进行HTTP检测
 						firstScanCompleted.RLock()
 						firstDone := firstScanCompleted.done
 						firstScanCompleted.RUnlock()
-
-						log.Printf("[DEBUG] 端口 %d: firstScanCompleted.done = %v", info.Port, firstDone)
-
+						
 						if !firstDone {
 							shouldDetect = true
-							log.Printf("[DEBUG] 端口 %d: 首次检测，shouldDetect = true", info.Port)
 						}
 
 						// 后续检测：只要首次检测没完成，且还没检测到成功，就一直检测
@@ -437,19 +418,15 @@ func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 							httpAliveHistory.RUnlock()
 							// 只要首次检测没完成，且还没检测到成功，就一直检测
 							shouldDetect = !firstDone || everAlive
-							log.Printf("[DEBUG] 端口 %d: 后续检测，everAlive = %v, firstDone = %v, shouldDetect = %v", info.Port, everAlive, firstDone, shouldDetect)
 						}
 
 						if shouldDetect {
-							log.Printf("[DEBUG] 端口 %d 需要检测，加入队列", info.Port)
 							// 加入异步检测队列
 							httpDetectionQueue.Lock()
 							httpDetectionQueue.ports[info.Port] = true
 							httpDetectionQueue.Unlock()
 
 							// 首次检测时不暴露指标，等检测到HTTP服务后再暴露
-						} else {
-							log.Printf("[DEBUG] 端口 %d 不需要检测", info.Port)
 						}
 
 						// 检查历史记录，只暴露曾经HTTP成功的端口
@@ -467,13 +444,11 @@ func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 								ch <- prometheus.MustNewConstMetric(
 									c.httpAliveDesc, prometheus.GaugeValue, float64(currentStatus), labels...,
 								)
-								log.Printf("[DEBUG] 端口 %d 暴露HTTP指标: %d (历史记录)", info.Port, currentStatus)
 							} else {
 								// 缓存中没有，先暴露0
 								ch <- prometheus.MustNewConstMetric(
 									c.httpAliveDesc, prometheus.GaugeValue, 0, labels...,
 								)
-								log.Printf("[DEBUG] 端口 %d 暴露HTTP指标: 0 (历史记录，无缓存)", info.Port)
 							}
 						}
 					}
