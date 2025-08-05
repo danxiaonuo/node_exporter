@@ -143,6 +143,7 @@ var firstScanCompleted = struct {
 
 // 新增：HTTP检测异步处理器
 func startHTTPDetectionWorker() {
+	log.Printf("[port_process_collector] HTTP检测工作器已启动")
 	go func() {
 		ticker := time.NewTicker(3 * time.Second) // 每3秒处理一次队列，提高响应速度
 		defer ticker.Stop()
@@ -160,6 +161,10 @@ func startHTTPDetectionWorker() {
 				httpDetectionQueue.ports = make(map[int]bool)
 				httpDetectionQueue.Unlock()
 
+				if len(ports) > 0 {
+					log.Printf("[port_process_collector] 开始HTTP检测，端口数量: %d, 端口: %v", len(ports), ports)
+				}
+
 				// 异步检测所有排队的端口，使用信号量控制并发数
 				sem := make(chan struct{}, httpDetectionConcurrency) // 使用配置的并发数
 				var wg sync.WaitGroup
@@ -171,6 +176,8 @@ func startHTTPDetectionWorker() {
 						defer func() { <-sem }()
 
 						status := checkPortHTTP(p)
+						log.Printf("[port_process_collector] 端口 %d HTTP检测结果: %d", p, status)
+
 						httpStatusCache.RWMutex.Lock()
 						httpStatusCache.Status[p] = status
 						httpStatusCache.LastCheck[p] = time.Now()
@@ -178,6 +185,7 @@ func startHTTPDetectionWorker() {
 							httpAliveHistory.Lock()
 							httpAliveHistory.Ports[p] = true
 							httpAliveHistory.Unlock()
+							log.Printf("[port_process_collector] 端口 %d 已添加到HTTP历史记录", p)
 						}
 						httpStatusCache.RWMutex.Unlock()
 					}(port)
@@ -186,7 +194,10 @@ func startHTTPDetectionWorker() {
 
 				// 标记首次全量检测完成
 				firstScanCompleted.Lock()
-				firstScanCompleted.done = true
+				if !firstScanCompleted.done {
+					firstScanCompleted.done = true
+					log.Printf("[port_process_collector] 首次全量HTTP检测已完成")
+				}
 				firstScanCompleted.Unlock()
 			}
 		}
@@ -411,6 +422,7 @@ func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 							httpDetectionQueue.Lock()
 							httpDetectionQueue.ports[info.Port] = true
 							httpDetectionQueue.Unlock()
+							log.Printf("[port_process_collector] 端口 %d 已加入HTTP检测队列", info.Port)
 						}
 
 						// 检查历史记录，如果有过HTTP存活记录，先暴露0
