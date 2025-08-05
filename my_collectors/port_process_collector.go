@@ -141,8 +141,6 @@ var firstScanCompleted = struct {
 	done bool
 }{done: false}
 
-
-
 // 新增：HTTP检测异步处理器
 func startHTTPDetectionWorker() {
 	go func() {
@@ -195,7 +193,7 @@ func startHTTPDetectionWorker() {
 						firstScanCompleted.done = true
 					}
 					firstScanCompleted.Unlock()
-
+				}
 			}
 		}
 	}()
@@ -402,11 +400,11 @@ func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 						// 检查是否需要进行HTTP检测
 						shouldDetect := false
 
-												// 首次全量检测：对所有TCP端口进行HTTP检测
+						// 首次全量检测：对所有TCP端口进行HTTP检测
 						firstScanCompleted.RLock()
 						firstDone := firstScanCompleted.done
 						firstScanCompleted.RUnlock()
-						
+
 						if !firstDone {
 							shouldDetect = true
 						}
