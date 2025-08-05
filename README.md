@@ -105,6 +105,7 @@ func (c *MyCollector) Collect(ch chan<- prometheus.Metric) {
 - **端口-进程采集器（port_process_collector.go）**
   - 自动发现监听端口与进程，检测 TCP/UDP/HTTP 存活、响应时间
   - 支持高并发、超时、排除进程、容器兼容等
+  - HTTP检测采用异步机制，严格协议验证，避免误报
   - 所有检测周期、超时、并发数均可通过环境变量配置
   - 详见 [`my_collectors/PORT_PROCESS_COLLECTOR.md`](my_collectors/PORT_PROCESS_COLLECTOR.md)
 - **硬件信息采集器（hardware_info_collector.go）**
@@ -125,10 +126,13 @@ func (c *MyCollector) Collect(ch chan<- prometheus.Metric) {
 |--------|------|--------|
 | PORT_LABEL_INTERVAL | 端口-进程标签发现周期 | 8h |
 | PORT_STATUS_INTERVAL | TCP端口检测周期 | 1m |
-| PORT_HTTP_STATUS_INTERVAL | HTTP端口检测周期 | 1m |
+| PORT_HTTP_STATUS_INTERVAL | HTTP端口检测周期 | 5m |
+| HTTP_DETECTION_INTERVAL | HTTP检测工作器处理间隔 | 1m |
+| HTTP_DETECTION_CONCURRENCY | HTTP检测并发数 | 10 |
+| ENABLE_HTTP_DETECTION | 是否启用HTTP检测 | true |
 | PORT_UDP_STATUS_INTERVAL | UDP端口检测周期 | 1m |
 | PROCESS_ALIVE_STATUS_INTERVAL | 进程检测周期 | 1m |
-| PORT_CHECK_TIMEOUT | 端口检测超时时间 | 2s |
+| PORT_CHECK_TIMEOUT | 端口检测超时时间 | 3s |
 | MAX_PARALLEL_IP_CHECKS | 端口检测最大并发数 | 8 |
 | EXCLUDED_PROCESS_NAMES | 排除进程名（逗号分隔） | - |
 | PROC_PREFIX | 容器下 /proc 路径前缀 | 自动判断 |
@@ -146,6 +150,11 @@ docker run --rm \
   --privileged \
   -v /proc:/host/proc:ro \
   -e PROC_PREFIX=/host/proc \
+  -e PORT_CHECK_TIMEOUT=3s \
+  -e PORT_HTTP_STATUS_INTERVAL=5m \
+  -e HTTP_DETECTION_INTERVAL=1m \
+  -e HTTP_DETECTION_CONCURRENCY=10 \
+  -e ENABLE_HTTP_DETECTION=true \
   -e EXCLUDED_PROCESS_NAMES=nginx,redis \
   --user root \
   your_image_name
@@ -166,6 +175,16 @@ containers:
     env:
       - name: PROC_PREFIX
         value: /host/proc
+      - name: PORT_CHECK_TIMEOUT
+        value: "3s"
+      - name: PORT_HTTP_STATUS_INTERVAL
+        value: "5m"
+      - name: HTTP_DETECTION_INTERVAL
+        value: "1m"
+      - name: HTTP_DETECTION_CONCURRENCY
+        value: "10"
+      - name: ENABLE_HTTP_DETECTION
+        value: "true"
       - name: EXCLUDED_PROCESS_NAMES
         value: nginx,redis
 volumes:
@@ -195,6 +214,8 @@ volumes:
   - 请确保挂载 `/proc` 并以 root/特权模式运行，`PROC_PREFIX` 配置正确
 - **如何只采集/排除特定进程？**
   - 配置 `EXCLUDED_PROCESS_NAMES` 环境变量
+- **HTTP检测遇到"Unsolicited response received on idle HTTP channel"报错？**
+  - 说明：HTTP检测遇到非HTTP协议端口（如VNC/RFB）时会报此错，已通过严格协议判断优化，建议升级到最新版
 - **更多问题**：详见各插件 `*.md` 文档
 
 ---
