@@ -432,18 +432,12 @@ func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 							httpDetectionQueue.ports[info.Port] = true
 							httpDetectionQueue.Unlock()
 
-							// 首次检测时，先暴露0，等检测结果出来后再更新
-							if !firstDone {
-								ch <- prometheus.MustNewConstMetric(
-									c.httpAliveDesc, prometheus.GaugeValue, 0, labels...,
-								)
-								log.Printf("[DEBUG] 端口 %d 首次检测，暴露HTTP指标: 0", info.Port)
-							}
+							// 首次检测时不暴露指标，等检测到HTTP服务后再暴露
 						} else {
 							log.Printf("[DEBUG] 端口 %d 不需要检测", info.Port)
 						}
 
-						// 检查历史记录，如果有过HTTP存活记录，暴露对应状态
+						// 检查历史记录，只暴露曾经HTTP成功的端口
 						httpAliveHistory.RLock()
 						everAlive := httpAliveHistory.Ports[info.Port]
 						httpAliveHistory.RUnlock()
@@ -458,11 +452,13 @@ func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 								ch <- prometheus.MustNewConstMetric(
 									c.httpAliveDesc, prometheus.GaugeValue, float64(currentStatus), labels...,
 								)
+								log.Printf("[DEBUG] 端口 %d 暴露HTTP指标: %d (历史记录)", info.Port, currentStatus)
 							} else {
 								// 缓存中没有，先暴露0
 								ch <- prometheus.MustNewConstMetric(
 									c.httpAliveDesc, prometheus.GaugeValue, 0, labels...,
 								)
+								log.Printf("[DEBUG] 端口 %d 暴露HTTP指标: 0 (历史记录，无缓存)", info.Port)
 							}
 						}
 					}
