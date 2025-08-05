@@ -365,6 +365,7 @@ func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 
 				// HTTP检测优化：异步处理，智能过滤
 				if enableHTTPDetection {
+					log.Printf("[DEBUG] 端口 %d 开始HTTP检测逻辑", info.Port)
 					// 检查缓存中是否已有结果
 					httpStatusCache.RWMutex.RLock()
 					now := time.Now()
@@ -382,14 +383,18 @@ func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 						everAlive := httpAliveHistory.Ports[info.Port]
 						httpAliveHistory.RUnlock()
 
+						log.Printf("[DEBUG] 端口 %d 有缓存: httpAlive=%d, everAlive=%v", info.Port, httpAlive, everAlive)
+
 						if httpAlive == 1 {
 							ch <- prometheus.MustNewConstMetric(
 								c.httpAliveDesc, prometheus.GaugeValue, 1, labels...,
 							)
+							log.Printf("[DEBUG] 端口 %d 暴露HTTP指标: 1", info.Port)
 						} else if everAlive {
 							ch <- prometheus.MustNewConstMetric(
 								c.httpAliveDesc, prometheus.GaugeValue, 0, labels...,
 							)
+							log.Printf("[DEBUG] 端口 %d 暴露HTTP指标: 0 (历史记录)", info.Port)
 						}
 					} else {
 						// 检查是否需要进行HTTP检测
@@ -411,6 +416,7 @@ func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 						}
 
 						if shouldDetect {
+							log.Printf("[DEBUG] 端口 %d 需要检测，加入队列", info.Port)
 							// 加入异步检测队列
 							httpDetectionQueue.Lock()
 							httpDetectionQueue.ports[info.Port] = true
@@ -422,19 +428,34 @@ func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 								ch <- prometheus.MustNewConstMetric(
 									c.httpAliveDesc, prometheus.GaugeValue, 0, labels...,
 								)
+								log.Printf("[DEBUG] 端口 %d 首次检测，暴露HTTP指标: 0", info.Port)
 							}
 							firstScanCompleted.RUnlock()
+						} else {
+							log.Printf("[DEBUG] 端口 %d 不需要检测", info.Port)
 						}
 
-						// 检查历史记录，如果有过HTTP存活记录，先暴露0
+						// 检查历史记录，如果有过HTTP存活记录，暴露对应状态
 						httpAliveHistory.RLock()
 						everAlive := httpAliveHistory.Ports[info.Port]
 						httpAliveHistory.RUnlock()
 
 						if everAlive {
-							ch <- prometheus.MustNewConstMetric(
-								c.httpAliveDesc, prometheus.GaugeValue, 0, labels...,
-							)
+							// 如果有历史记录，检查当前缓存状态
+							httpStatusCache.RWMutex.RLock()
+							currentStatus, exists := httpStatusCache.Status[info.Port]
+							httpStatusCache.RWMutex.RUnlock()
+
+							if exists {
+								ch <- prometheus.MustNewConstMetric(
+									c.httpAliveDesc, prometheus.GaugeValue, float64(currentStatus), labels...,
+								)
+							} else {
+								// 缓存中没有，先暴露0
+								ch <- prometheus.MustNewConstMetric(
+									c.httpAliveDesc, prometheus.GaugeValue, 0, labels...,
+								)
+							}
 						}
 					}
 				}
