@@ -90,6 +90,7 @@ node_process_alive{process_name="nginx", exe_path="/usr/sbin/nginx"} 1
 ```
 - 1 表示进程存活，0 表示进程不存在。
 - 检测结果有缓存，刷新周期由 `PROCESS_ALIVE_STATUS_INTERVAL` 控制。
+- **去重机制：每个唯一进程（进程名+路径组合）只采集一次，避免重复上报。**
 
 ## 工作原理
 
@@ -124,7 +125,7 @@ node_process_alive{process_name="nginx", exe_path="/usr/sbin/nginx"} 1
 - 插件对服务器性能影响极小，适合生产环境使用。
 - **UDP端口只采集存在性（带检测缓存，周期可配置），不采集响应时间。**
 - **本采集器已适配 node_exporter 的本地 Collector 接口，实现了 Update 方法，兼容 Prometheus 和 node_exporter 框架。**
-- **node_process_alive 指标只会为每个唯一进程采集和上报一次，检测结果有缓存，周期可配置，避免重复指标冲突。**
+- **node_process_alive 指标只会为每个唯一进程（进程名+路径组合）采集和上报一次，检测结果有缓存，周期可配置，避免重复指标冲突。**
 - **{process_name, exe_path} 的对象池是在首次启动和每次标签刷新周期时更新，采集指标时遍历的是上次发现的那一批对象。**
 
 ## 常见问题

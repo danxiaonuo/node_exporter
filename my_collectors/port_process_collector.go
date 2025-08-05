@@ -252,7 +252,7 @@ var processAliveCache = &processAliveCacheStruct{
 // TCP/UDP端口分别采集，指标名区分，HTTP端口单独采集
 func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 	infos := getPortProcessInfo()      // 获取端口与进程列表（8小时刷新一次）
-	reportedPids := make(map[int]bool) // 记录已上报的进程，避免重复
+	reportedProcessKeys := make(map[string]bool) // 记录已上报的进程，避免重复（基于进程名+路径）
 	tcpPortDone := make(map[int]bool)
 	udpPortDone := make(map[int]bool)
 	for _, info := range infos {
@@ -295,14 +295,15 @@ func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 				udpPortDone[info.Port] = true
 			}
 		}
-		// 进程存活指标去重：每个唯一pid只采集一次
-		if !reportedPids[info.Pid] {
+		// 进程存活指标去重：每个唯一进程（进程名+路径）只采集一次
+		processKey := info.ProcessName + "|" + info.ExePath
+		if !reportedProcessKeys[processKey] {
 			procAlive := getProcessAliveStatus(info.Pid)
 			ch <- prometheus.MustNewConstMetric(
 				c.processAliveDesc, prometheus.GaugeValue, float64(procAlive),
 				info.ProcessName, info.ExePath,
 			)
-			reportedPids[info.Pid] = true
+			reportedProcessKeys[processKey] = true
 		}
 	}
 }
