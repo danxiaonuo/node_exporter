@@ -212,7 +212,7 @@ var (
 				return d
 			}
 		}
-		return time.Minute
+		return 30 * time.Second // 减少到30秒，提高缓存命中率
 	}()
 	portLabelInterval = func() time.Duration {
 		if v := os.Getenv("PORT_LABEL_INTERVAL"); v != "" {
@@ -298,7 +298,7 @@ var (
 				return d
 			}
 		}
-		return time.Minute // 默认1分钟处理一次队列
+		return 30 * time.Second // 默认30秒处理一次队列，提高响应速度
 	}()
 	// 新增：快速模式配置，减少指标暴露时间
 	fastMode = func() bool {
@@ -308,7 +308,7 @@ var (
 				return enabled
 			}
 		}
-		return false // 默认关闭快速模式
+		return true // 默认启用快速模式，提高性能稳定性
 	}()
 )
 
@@ -417,6 +417,29 @@ func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 						httpDetectionQueue.Lock()
 						httpDetectionQueue.ports[info.Port] = true
 						httpDetectionQueue.Unlock()
+
+						// 智能回退策略：优先使用历史状态，避免指标跳跃
+						httpAliveHistory.RLock()
+						everAlive := httpAliveHistory.Ports[info.Port]
+						httpAliveHistory.RUnlock()
+
+						if everAlive {
+							// 曾经HTTP成功过，使用历史状态作为临时值
+							httpStatusCache.RWMutex.RLock()
+							if lastStatus, exists := httpStatusCache.Status[info.Port]; exists {
+								// 使用上次的检测结果作为临时值
+								ch <- prometheus.MustNewConstMetric(
+									c.httpAliveDesc, prometheus.GaugeValue, float64(lastStatus), labels...,
+								)
+							} else {
+								// 没有缓存但有历史记录，假设为存活状态
+								ch <- prometheus.MustNewConstMetric(
+									c.httpAliveDesc, prometheus.GaugeValue, 1, labels...,
+								)
+							}
+							httpStatusCache.RWMutex.RUnlock()
+						}
+						// 如果没有历史记录，则不暴露HTTP指标，等待异步检测完成
 					}
 				}
 				tcpPortDone[info.Port] = true
