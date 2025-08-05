@@ -413,17 +413,10 @@ func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 							)
 						}
 					} else {
-						// 简化HTTP检测逻辑：只在首次扫描时进行检测
-						firstScanCompleted.RLock()
-						firstDone := firstScanCompleted.done
-						firstScanCompleted.RUnlock()
-
-						if !firstDone {
-							// 加入异步检测队列
-							httpDetectionQueue.Lock()
-							httpDetectionQueue.ports[info.Port] = true
-							httpDetectionQueue.Unlock()
-						}
+						// HTTP检测逻辑：缓存过期时加入异步检测队列
+						httpDetectionQueue.Lock()
+						httpDetectionQueue.ports[info.Port] = true
+						httpDetectionQueue.Unlock()
 					}
 				}
 				tcpPortDone[info.Port] = true
