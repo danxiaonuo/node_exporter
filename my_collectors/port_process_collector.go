@@ -144,7 +144,7 @@ var firstScanCompleted = struct {
 // 新增：HTTP检测异步处理器
 func startHTTPDetectionWorker() {
 	go func() {
-		ticker := time.NewTicker(1 * time.Minute) // 每1分钟处理一次队列，减少资源消耗
+		ticker := time.NewTicker(httpDetectionInterval) // 每1分钟处理一次队列，减少资源消耗
 		defer ticker.Stop()
 		for {
 			select {
@@ -259,7 +259,7 @@ var (
 				return d
 			}
 		}
-		return 1 * time.Second // 减少到1秒，避免长时间阻塞
+		return 3 * time.Second // 默认3秒，适应更多网络环境
 	}()
 	maxParallelIPChecks = func() int {
 		if v := os.Getenv("MAX_PARALLEL_IP_CHECKS"); v != "" {
@@ -289,6 +289,16 @@ var (
 			}
 		}
 		return 10 // 默认10个并发
+	}()
+	// 新增：HTTP检测工作器处理间隔配置
+	httpDetectionInterval = func() time.Duration {
+		if v := os.Getenv("HTTP_DETECTION_INTERVAL"); v != "" {
+			d, err := time.ParseDuration(v)
+			if err == nil {
+				return d
+			}
+		}
+		return time.Minute // 默认1分钟处理一次队列
 	}()
 )
 
@@ -699,9 +709,20 @@ func checkPortHTTP(port int) int {
 			url = "http://" + ip + ":" + strconv.Itoa(port)
 		}
 		resp, err := client.Get(url)
-		if err == nil && resp != nil && len(resp.Header) > 0 {
+		if err == nil && resp != nil {
+			// 更严格的HTTP检测：检查状态码和Content-Type
+			if resp.StatusCode >= 200 && resp.StatusCode < 600 {
+				contentType := resp.Header.Get("Content-Type")
+				// 检查是否为有效的HTTP响应
+				if contentType != "" || resp.Header.Get("Server") != "" ||
+					strings.HasPrefix(resp.Header.Get("Content-Type"), "text/") ||
+					strings.HasPrefix(resp.Header.Get("Content-Type"), "application/") ||
+					strings.HasPrefix(resp.Header.Get("Content-Type"), "image/") {
+					resp.Body.Close()
+					return 1
+				}
+			}
 			resp.Body.Close()
-			return 1
 		}
 	}
 	// 常用地址都不通，再检测所有本地IP（并发）
@@ -744,13 +765,24 @@ func checkPortHTTP(port int) int {
 				url = "http://" + ip + ":" + strconv.Itoa(port)
 			}
 			resp, err := client.Get(url)
-			if err == nil && resp != nil && len(resp.Header) > 0 {
-				resp.Body.Close()
-				select {
-				case resultCh <- struct{}{}:
-					cancel() // 有一个成功就取消其他
-				default:
+			if err == nil && resp != nil {
+				// 更严格的HTTP检测：检查状态码和Content-Type
+				if resp.StatusCode >= 200 && resp.StatusCode < 600 {
+					contentType := resp.Header.Get("Content-Type")
+					// 检查是否为有效的HTTP响应
+					if contentType != "" || resp.Header.Get("Server") != "" ||
+						strings.HasPrefix(resp.Header.Get("Content-Type"), "text/") ||
+						strings.HasPrefix(resp.Header.Get("Content-Type"), "application/") ||
+						strings.HasPrefix(resp.Header.Get("Content-Type"), "image/") {
+						resp.Body.Close()
+						select {
+						case resultCh <- struct{}{}:
+							cancel() // 有一个成功就取消其他
+						default:
+						}
+					}
 				}
+				resp.Body.Close()
 			}
 			<-sem
 		}(ip)
