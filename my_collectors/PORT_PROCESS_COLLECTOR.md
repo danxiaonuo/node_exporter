@@ -29,6 +29,12 @@
 | `HTTP_DETECTION_INTERVAL` | `1m` | HTTP 检测工作器处理间隔 |
 | `HTTP_DETECTION_CONCURRENCY` | `10` | HTTP 检测并发工作器数量 |
 
+### 性能优化
+
+| 变量名 | 默认值 | 说明 |
+|--------|--------|------|
+| `FAST_MODE` | `false` | 快速模式，减少超时时间以加快指标暴露速度 |
+
 ### 进程监控
 
 | 变量名 | 默认值 | 说明 |
@@ -161,6 +167,9 @@ export HTTP_DETECTION_CONCURRENCY=20
 
 # 减少超时时间以加快失败检测
 export PORT_CHECK_TIMEOUT=1s
+
+# 启用快速模式以加快指标暴露速度
+export FAST_MODE=true
 ```
 
 ### 低资源环境
@@ -178,12 +187,26 @@ export HTTP_DETECTION_CONCURRENCY=5
 
 # 增加超时时间以适应较慢的网络
 export PORT_CHECK_TIMEOUT=5s
+
+# 启用快速模式以加快指标暴露速度
+export FAST_MODE=true
 ```
 
 ### 禁用 HTTP 检测
 
 ```bash
 # 完全禁用 HTTP 检测以节省资源
+export ENABLE_HTTP_DETECTION=false
+```
+
+### 解决 broken pipe 错误
+
+```bash
+# 启用快速模式，减少超时时间以加快指标暴露速度
+export FAST_MODE=true
+export PORT_CHECK_TIMEOUT=1s
+
+# 或者完全禁用HTTP检测以减少网络活动
 export ENABLE_HTTP_DETECTION=false
 ```
 
@@ -205,11 +228,13 @@ export ENABLE_HTTP_DETECTION=false
 
 1. **"Unsolicited response received on idle HTTP channel"**: 这表示 HTTP 检测遇到了非 HTTP 服务（如 VNC）。检测逻辑已经改进，更加严格。
 
-2. **资源使用过高**: 考虑增加间隔时间并减少并发数。
+2. **"write: broken pipe" 错误**: 这表示客户端在指标暴露过程中断开了连接。建议启用快速模式：`export FAST_MODE=true`，或减少超时时间：`export PORT_CHECK_TIMEOUT=1s`。
 
-3. **缺少进程信息**: 确保容器可以访问主机的 `/proc` 文件系统。
+3. **资源使用过高**: 考虑增加间隔时间并减少并发数。
 
-4. **权限被拒绝错误**: 使用 `--privileged` 运行容器或适当的权限。
+4. **缺少进程信息**: 确保容器可以访问主机的 `/proc` 文件系统。
+
+5. **权限被拒绝错误**: 使用 `--privileged` 运行容器或适当的权限。
 
 ### 调试模式
 

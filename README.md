@@ -130,6 +130,7 @@ func (c *MyCollector) Collect(ch chan<- prometheus.Metric) {
 | HTTP_DETECTION_INTERVAL | HTTP检测工作器处理间隔 | 1m |
 | HTTP_DETECTION_CONCURRENCY | HTTP检测并发数 | 10 |
 | ENABLE_HTTP_DETECTION | 是否启用HTTP检测 | true |
+| FAST_MODE | 快速模式，减少超时时间以加快指标暴露速度 | false |
 | PORT_UDP_STATUS_INTERVAL | UDP端口检测周期 | 1m |
 | PROCESS_ALIVE_STATUS_INTERVAL | 进程检测周期 | 1m |
 | PORT_CHECK_TIMEOUT | 端口检测超时时间 | 3s |
@@ -216,6 +217,8 @@ volumes:
   - 配置 `EXCLUDED_PROCESS_NAMES` 环境变量
 - **HTTP检测遇到"Unsolicited response received on idle HTTP channel"报错？**
   - 说明：HTTP检测遇到非HTTP协议端口（如VNC/RFB）时会报此错，已通过严格协议判断优化，建议升级到最新版
+- **遇到"write: broken pipe"错误？**
+  - 说明：客户端在指标暴露过程中断开了连接，建议启用快速模式：`export FAST_MODE=true`，或减少超时时间：`export PORT_CHECK_TIMEOUT=1s`
 - **更多问题**：详见各插件 `*.md` 文档
 
 ---

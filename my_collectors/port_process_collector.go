@@ -300,6 +300,16 @@ var (
 		}
 		return time.Minute // 默认1分钟处理一次队列
 	}()
+	// 新增：快速模式配置，减少指标暴露时间
+	fastMode = func() bool {
+		if v := os.Getenv("FAST_MODE"); v != "" {
+			enabled, err := strconv.ParseBool(v)
+			if err == nil {
+				return enabled
+			}
+		}
+		return false // 默认关闭快速模式
+	}()
 )
 
 type portStatusCacheStruct struct {
@@ -363,6 +373,7 @@ func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 	tcpPortDone := make(map[int]bool)
 	udpPortDone := make(map[int]bool)
 
+	// 优化：批量处理，减少锁竞争和HTTP检测逻辑复杂度
 	for _, info := range infos {
 		labels := []string{info.ProcessName, info.ExePath, strconv.Itoa(info.Port)}
 		if info.Protocol == "tcp" {
@@ -376,9 +387,9 @@ func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 					c.portTCPRespDesc, prometheus.GaugeValue, respTime, labels...,
 				)
 
-				// HTTP检测优化：异步处理，智能过滤
+				// HTTP检测优化：简化逻辑，减少锁竞争
 				if enableHTTPDetection {
-					// 检查缓存中是否已有结果
+					// 快速检查缓存
 					httpStatusCache.RWMutex.RLock()
 					now := time.Now()
 					t, ok := httpStatusCache.LastCheck[info.Port]
@@ -402,36 +413,17 @@ func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 							)
 						}
 					} else {
-						// 检查是否需要进行HTTP检测
-						shouldDetect := false
-
-						// 首次全量检测：对所有TCP端口进行HTTP检测
+						// 简化HTTP检测逻辑：只在首次扫描时进行检测
 						firstScanCompleted.RLock()
 						firstDone := firstScanCompleted.done
 						firstScanCompleted.RUnlock()
 
 						if !firstDone {
-							shouldDetect = true
-						}
-
-						// 后续检测：只要首次检测没完成，且还没检测到成功，就一直检测
-						if !shouldDetect {
-							httpAliveHistory.RLock()
-							everAlive := httpAliveHistory.Ports[info.Port]
-							httpAliveHistory.RUnlock()
-							// 只要首次检测没完成，且还没检测到成功，就一直检测
-							shouldDetect = !firstDone || everAlive
-						}
-
-						if shouldDetect {
 							// 加入异步检测队列
 							httpDetectionQueue.Lock()
 							httpDetectionQueue.ports[info.Port] = true
 							httpDetectionQueue.Unlock()
-
-							// 首次检测时不暴露指标，等检测到HTTP服务后再暴露
 						}
-
 					}
 				}
 				tcpPortDone[info.Port] = true
@@ -898,7 +890,16 @@ func getPortStatus(port int) (alive int, respTime float64) {
 		// 再次检查，防止并发下重复写
 		t, ok = portStatusCache.LastCheck[port]
 		if !ok || now.Sub(t) > portStatusInterval {
-			alive, respTime = checkPortTCP(port)
+			// 快速模式下使用更短的超时时间
+			if fastMode {
+				// 在快速模式下，使用更短的超时时间进行检测
+				originalTimeout := portCheckTimeout
+				portCheckTimeout = 500 * time.Millisecond
+				alive, respTime = checkPortTCP(port)
+				portCheckTimeout = originalTimeout
+			} else {
+				alive, respTime = checkPortTCP(port)
+			}
 			portStatusCache.Status[port] = alive
 			portStatusCache.RespTime[port] = respTime
 			portStatusCache.LastCheck[port] = now
