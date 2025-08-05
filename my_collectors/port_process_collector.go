@@ -128,6 +128,65 @@ var httpAliveHistory = struct {
 	Ports map[int]bool
 }{Ports: make(map[int]bool)}
 
+// 新增：HTTP检测异步化，避免阻塞指标暴露
+var httpDetectionQueue = struct {
+	sync.Mutex
+	ports map[int]bool
+	done  chan struct{}
+}{ports: make(map[int]bool), done: make(chan struct{})}
+
+// 新增：HTTP检测异步处理器
+func startHTTPDetectionWorker() {
+	go func() {
+		ticker := time.NewTicker(3 * time.Second) // 每3秒处理一次队列，提高响应速度
+		defer ticker.Stop()
+		for {
+			select {
+			case <-httpDetectionQueue.done:
+				return
+			case <-ticker.C:
+				httpDetectionQueue.Lock()
+				ports := make([]int, 0, len(httpDetectionQueue.ports))
+				for port := range httpDetectionQueue.ports {
+					ports = append(ports, port)
+				}
+				// 清空队列
+				httpDetectionQueue.ports = make(map[int]bool)
+				httpDetectionQueue.Unlock()
+
+				// 异步检测所有排队的端口，使用信号量控制并发数
+				sem := make(chan struct{}, httpDetectionConcurrency()) // 使用配置的并发数
+				var wg sync.WaitGroup
+				for _, port := range ports {
+					wg.Add(1)
+					go func(p int) {
+						defer wg.Done()
+						sem <- struct{}{}
+						defer func() { <-sem }()
+
+						status := checkPortHTTP(p)
+						httpStatusCache.RWMutex.Lock()
+						httpStatusCache.Status[p] = status
+						httpStatusCache.LastCheck[p] = time.Now()
+						if status == 1 {
+							httpAliveHistory.Lock()
+							httpAliveHistory.Ports[p] = true
+							httpAliveHistory.Unlock()
+						}
+						httpStatusCache.RWMutex.Unlock()
+					}(port)
+				}
+				wg.Wait()
+			}
+		}
+	}()
+}
+
+// 新增：初始化HTTP检测工作器
+func init() {
+	startHTTPDetectionWorker()
+}
+
 var (
 	portStatusInterval = func() time.Duration {
 		if v := os.Getenv("PORT_STATUS_INTERVAL"); v != "" {
@@ -183,7 +242,7 @@ var (
 				return d
 			}
 		}
-		return 2 * time.Second
+		return 1 * time.Second // 减少到1秒，避免长时间阻塞
 	}()
 	maxParallelIPChecks = func() int {
 		if v := os.Getenv("MAX_PARALLEL_IP_CHECKS"); v != "" {
@@ -193,6 +252,26 @@ var (
 			}
 		}
 		return 8
+	}()
+	// 新增：是否启用HTTP检测的环境变量
+	enableHTTPDetection = func() bool {
+		if v := os.Getenv("ENABLE_HTTP_DETECTION"); v != "" {
+			enabled, err := strconv.ParseBool(v)
+			if err == nil {
+				return enabled
+			}
+		}
+		return true // 默认启用
+	}()
+	// 新增：HTTP检测并发数配置
+	httpDetectionConcurrency = func() int {
+		if v := os.Getenv("HTTP_DETECTION_CONCURRENCY"); v != "" {
+			n, err := strconv.Atoi(v)
+			if err == nil && n > 0 {
+				return n
+			}
+		}
+		return 10 // 默认10个并发
 	}()
 )
 
@@ -251,14 +330,16 @@ var processAliveCache = &processAliveCacheStruct{
 // Collect 方法：实现 Prometheus Collector 接口，采集所有指标
 // TCP/UDP端口分别采集，指标名区分，HTTP端口单独采集
 func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
-	infos := getPortProcessInfo()      // 获取端口与进程列表（8小时刷新一次）
+	infos := getPortProcessInfo()                // 获取端口与进程列表（8小时刷新一次）
 	reportedProcessKeys := make(map[string]bool) // 记录已上报的进程，避免重复（基于进程名+路径）
 	tcpPortDone := make(map[int]bool)
 	udpPortDone := make(map[int]bool)
+
 	for _, info := range infos {
 		labels := []string{info.ProcessName, info.ExePath, strconv.Itoa(info.Port)}
 		if info.Protocol == "tcp" {
 			if !tcpPortDone[info.Port] {
+				// TCP端口存活和响应时间（快速检测，不阻塞）
 				alive, respTime := getPortStatus(info.Port)
 				ch <- prometheus.MustNewConstMetric(
 					c.portTCPAliveDesc, prometheus.GaugeValue, float64(alive), labels...,
@@ -266,23 +347,52 @@ func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 				ch <- prometheus.MustNewConstMetric(
 					c.portTCPRespDesc, prometheus.GaugeValue, respTime, labels...,
 				)
-				httpAlive := getPortHTTPStatus(info.Port) // 修改为带缓存的 HTTP 检测
-				httpAliveHistory.RLock()
-				everAlive := httpAliveHistory.Ports[info.Port]
-				httpAliveHistory.RUnlock()
-				if httpAlive == 1 {
-					// 记录端口曾经通
-					httpAliveHistory.Lock()
-					httpAliveHistory.Ports[info.Port] = true
-					httpAliveHistory.Unlock()
-					ch <- prometheus.MustNewConstMetric(
-						c.httpAliveDesc, prometheus.GaugeValue, 1, labels...,
-					)
-				} else if everAlive {
-					// 曾经通，现在不通，继续暴露 0
-					ch <- prometheus.MustNewConstMetric(
-						c.httpAliveDesc, prometheus.GaugeValue, 0, labels...,
-					)
+
+				// HTTP检测优化：异步处理，智能过滤
+				if enableHTTPDetection {
+					// 检查缓存中是否已有结果
+					httpStatusCache.RWMutex.RLock()
+					now := time.Now()
+					t, ok := httpStatusCache.LastCheck[info.Port]
+					hasCache := ok && now.Sub(t) <= httpStatusInterval
+					httpStatusCache.RWMutex.RUnlock()
+
+					if hasCache {
+						// 有缓存结果，直接使用
+						httpStatusCache.RWMutex.RLock()
+						httpAlive := httpStatusCache.Status[info.Port]
+						httpStatusCache.RWMutex.RUnlock()
+
+						httpAliveHistory.RLock()
+						everAlive := httpAliveHistory.Ports[info.Port]
+						httpAliveHistory.RUnlock()
+
+						if httpAlive == 1 {
+							ch <- prometheus.MustNewConstMetric(
+								c.httpAliveDesc, prometheus.GaugeValue, 1, labels...,
+							)
+						} else if everAlive {
+							ch <- prometheus.MustNewConstMetric(
+								c.httpAliveDesc, prometheus.GaugeValue, 0, labels...,
+							)
+						}
+					} else {
+						// 无缓存结果，加入异步检测队列
+						httpDetectionQueue.Lock()
+						httpDetectionQueue.ports[info.Port] = true
+						httpDetectionQueue.Unlock()
+
+						// 检查历史记录，如果有过HTTP存活记录，先暴露0
+						httpAliveHistory.RLock()
+						everAlive := httpAliveHistory.Ports[info.Port]
+						httpAliveHistory.RUnlock()
+
+						if everAlive {
+							ch <- prometheus.MustNewConstMetric(
+								c.httpAliveDesc, prometheus.GaugeValue, 0, labels...,
+							)
+						}
+					}
 				}
 				tcpPortDone[info.Port] = true
 			}

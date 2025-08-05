@@ -7,9 +7,9 @@
 - 自动发现主机所有监听**TCP/UDP端口**及其进程（标签内容每8小时刷新一次，周期可配置）
 - 检测TCP端口是否存活（带检测缓存，周期可配置，默认每1分钟检测一次）
 - 检测UDP端口是否存在（带检测缓存，周期可配置，默认每1分钟检测一次）
-- 检测HTTP端口存活（带检测缓存，周期可配置，默认每1分钟检测一次，仅对曾经HTTP存活的端口暴露）
+- 检测HTTP端口存活（异步检测，全量端口覆盖，智能缓存，避免阻塞指标暴露）
 - 检测TCP端口响应时间（带检测缓存，周期同上）
-- 检测进程是否存活（无检测缓存，每次采集实时判断）
+- 检测进程是否存活（带检测缓存，周期可配置，默认每1分钟检测一次）
 - 支持排除常见系统和监控进程，避免无意义采集
 - 适用于物理机和容器环境
 - **TCP/UDP/HTTP端口指标名称区分，UDP端口只采集存在性（带检测缓存），不采集响应时间**
@@ -19,7 +19,7 @@
 | 指标类型                | 检测缓存 | 环境变量                      | 默认周期   | 说明 |
 |------------------------|----------|-------------------------------|------------|------|
 | TCP端口存活/响应时间    | 有       | PORT_STATUS_INTERVAL, PORT_CHECK_TIMEOUT, MAX_PARALLEL_IP_CHECKS | 1分钟      | 端口可达性/响应时间，周期缓存，支持IPv4/IPv6，超时/并发可配 |
-| HTTP端口存活           | 有       | PORT_HTTP_STATUS_INTERVAL, PORT_CHECK_TIMEOUT, MAX_PARALLEL_IP_CHECKS | 1分钟      | 仅对曾经HTTP存活的端口暴露，周期缓存，支持IPv4/IPv6，超时/并发可配 |
+| HTTP端口存活           | 异步     | PORT_HTTP_STATUS_INTERVAL, PORT_CHECK_TIMEOUT, HTTP_DETECTION_CONCURRENCY | 异步检测   | 全量端口覆盖，异步检测不阻塞指标暴露，智能缓存，支持IPv4/IPv6 |
 | UDP端口存在性          | 有       | PORT_UDP_STATUS_INTERVAL      | 1分钟      | 仅判断fd存在，周期缓存 |
 | 进程存活               | 有       | PROCESS_ALIVE_STATUS_INTERVAL | 1分钟      | 进程是否存活，周期缓存 |
 | 端口-进程标签发现      | 有       | PORT_LABEL_INTERVAL           | 8小时      | 端口-进程映射，周期缓存 |
@@ -30,8 +30,10 @@
 - `PORT_UDP_STATUS_INTERVAL`：UDP端口存在性检测周期，默认与TCP一致。
 - `PROCESS_ALIVE_STATUS_INTERVAL`：进程存活检测缓存刷新周期，默认1分钟。
 - `PORT_LABEL_INTERVAL`：端口-进程标签发现周期，默认8小时。
-- `PORT_CHECK_TIMEOUT`：TCP/HTTP检测超时时间，默认2秒，支持慢服务和网络抖动。
+- `PORT_CHECK_TIMEOUT`：TCP/HTTP检测超时时间，默认1秒，避免长时间阻塞。
 - `MAX_PARALLEL_IP_CHECKS`：检测所有本地IP时的最大并发数，默认8，防止极端大规模主机拖垮性能。
+- `HTTP_DETECTION_CONCURRENCY`：HTTP检测并发数，默认10，控制异步检测负载。
+- `ENABLE_HTTP_DETECTION`：是否启用HTTP检测，默认true。
 - `EXCLUDED_PROCESS_NAMES`：自定义排除进程名，逗号分隔。
 - `PROC_PREFIX`：容器环境下指定proc路径前缀。
 
@@ -42,8 +44,10 @@ export PORT_HTTP_STATUS_INTERVAL=1m
 export PORT_UDP_STATUS_INTERVAL=1m
 export PROCESS_ALIVE_STATUS_INTERVAL=1m
 export PORT_LABEL_INTERVAL=8h
-export PORT_CHECK_TIMEOUT=2s
+export PORT_CHECK_TIMEOUT=1s
 export MAX_PARALLEL_IP_CHECKS=8
+export HTTP_DETECTION_CONCURRENCY=10
+export ENABLE_HTTP_DETECTION=true
 export EXCLUDED_PROCESS_NAMES=nginx,redis,customapp
 ```
 
@@ -71,10 +75,13 @@ node_tcp_port_response_seconds{process_name="nginx", exe_path="/usr/sbin/nginx",
 node_http_port_alive{process_name="nginx", exe_path="/usr/sbin/nginx", port="80"} 1
 ```
 - 1 表示HTTP服务可访问（有响应头），0 表示HTTP服务不可用或假死。
-- 仅对曾经HTTP检测通过的端口暴露，且检测结果有缓存，刷新周期由 `PORT_HTTP_STATUS_INTERVAL` 控制。
+- **异步检测机制**：HTTP检测在后台异步进行，不阻塞指标暴露，首次访问时可能无HTTP指标。
+- **全量端口覆盖**：对所有TCP端口进行HTTP检测，不限于常见端口。
+- **智能缓存**：检测结果有缓存，刷新周期由 `PORT_HTTP_STATUS_INTERVAL` 控制。
+- **历史记录**：曾经HTTP检测通过的端口会持续暴露指标（即使后续检测失败）。
 - 支持IPv4和IPv6监听端口。
-- 检测超时时间可通过 `PORT_CHECK_TIMEOUT` 配置，默认2秒。
-- 检测所有本地IP时最大并发数可通过 `MAX_PARALLEL_IP_CHECKS` 配置，默认8。
+- 检测超时时间可通过 `PORT_CHECK_TIMEOUT` 配置，默认1秒。
+- HTTP检测并发数可通过 `HTTP_DETECTION_CONCURRENCY` 配置，默认10。
 
 ### 4. UDP端口存活状态
 ```
@@ -105,7 +112,7 @@ node_process_alive{process_name="nginx", exe_path="/usr/sbin/nginx"} 1
    - 每隔 `PORT_STATUS_INTERVAL`（默认1分钟）检测一次所有已发现TCP端口的存活状态和响应时间，结果有缓存。
    - `node_tcp_port_alive` 只检测TCP连接是否可达，支持IPv4/IPv6，超时/并发可配。
    - `node_tcp_port_response_seconds` 只反映TCP连接耗时。
-   - `node_http_port_alive` 检测HTTP服务可用性（假死检测，检测周期同上，仅对曾经HTTP检测通过的端口暴露，结果有缓存，支持IPv4/IPv6，超时/并发可配）。
+   - `node_http_port_alive` 检测HTTP服务可用性（异步检测，全量端口覆盖，不阻塞指标暴露，检测结果有缓存，支持IPv4/IPv6，超时/并发可配）。
    - UDP端口只判断端口存在（进程fd存在），检测结果有缓存，周期可配置。
    - 进程检测只要 `/proc/<pid>` 存在即认为存活，检测结果有缓存，周期可配置。
 
@@ -137,7 +144,14 @@ node_process_alive{process_name="nginx", exe_path="/usr/sbin/nginx"} 1
 - **Q: 如何只采集特定端口或进程？**
   - 可在 `discoverPortProcess` 中增加白名单逻辑，或通过排除环境变量控制。
 - **Q: HTTP端口指标为什么有的端口不暴露？**
-  - 只有曾经HTTP检测通过的端口才会暴露该指标，且端口消失后指标消失。
+  - HTTP检测采用异步机制，首次访问时可能无HTTP指标，后续访问会逐步出现。
+  - 只有曾经HTTP检测通过的端口才会持续暴露该指标，且端口消失后指标消失。
+- **Q: 为什么会出现"broken pipe"错误？**
+  - 通常是因为指标暴露速度过慢，客户端主动断开连接。
+  - 已通过异步HTTP检测、减少超时时间、智能缓存等机制优化，大幅减少此类错误。
+- **Q: HTTP检测是否会影响指标暴露速度？**
+  - 不会，HTTP检测完全异步进行，不阻塞指标暴露。
+  - 采集时只返回缓存结果，无缓存时加入异步队列，后台处理。
 - **Q: UDP端口存活是怎么判断的？**
   - 只要进程fd存在该端口即认为存在，检测结果有缓存。
 - **Q: 进程存活是怎么判断的？**
@@ -432,14 +446,14 @@ env:
 
 - 作用：控制每个端口检测的最大等待时间，防止慢服务或网络异常拖慢整体采集。
 - 配置方式：
-  - 环境变量 `PORT_CHECK_TIMEOUT`，如 `2s`、`5s`、`1m` 等。
-  - **默认值：2秒**（2s）。
+  - 环境变量 `PORT_CHECK_TIMEOUT`，如 `1s`、`2s`、`5s` 等。
+  - **默认值：1秒**（1s）。
 - 建议：
-  - 绝大多数生产环境建议保持2秒或更低。
+  - 绝大多数生产环境建议保持1秒或更低。
   - 仅在极端慢服务排查时临时调大。
   - 超时时间过大（如1分钟）会极大拖慢 /metrics 暴露速度，尤其在端口未监听或IP不可达时。
 
 示例：
 ```sh
-export PORT_CHECK_TIMEOUT=2s
+export PORT_CHECK_TIMEOUT=1s
 ```
