@@ -859,9 +859,9 @@ func checkPortHTTPWithTimeout(port int, timeout time.Duration) int {
 				contentType := resp.Header.Get("Content-Type")
 				// 检查是否为有效的HTTP响应
 				if contentType != "" || resp.Header.Get("Server") != "" ||
-					strings.HasPrefix(resp.Header.Get("Content-Type"), "text/") ||
-					strings.HasPrefix(resp.Header.Get("Content-Type"), "application/") ||
-					strings.HasPrefix(resp.Header.Get("Content-Type"), "image/") {
+					strings.HasPrefix(contentType, "text/") ||
+					strings.HasPrefix(contentType, "application/") ||
+					strings.HasPrefix(contentType, "image/") {
 					resp.Body.Close()
 					return 1
 				}
@@ -915,9 +915,9 @@ func checkPortHTTPWithTimeout(port int, timeout time.Duration) int {
 					contentType := resp.Header.Get("Content-Type")
 					// 检查是否为有效的HTTP响应
 					if contentType != "" || resp.Header.Get("Server") != "" ||
-						strings.HasPrefix(resp.Header.Get("Content-Type"), "text/") ||
-						strings.HasPrefix(resp.Header.Get("Content-Type"), "application/") ||
-						strings.HasPrefix(resp.Header.Get("Content-Type"), "image/") {
+						strings.HasPrefix(contentType, "text/") ||
+						strings.HasPrefix(contentType, "application/") ||
+						strings.HasPrefix(contentType, "image/") {
 						resp.Body.Close()
 						select {
 						case resultCh <- struct{}{}:
