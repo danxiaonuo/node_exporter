@@ -155,7 +155,7 @@ func startHTTPDetectionWorker() {
 				httpDetectionQueue.Unlock()
 
 				// 异步检测所有排队的端口，使用信号量控制并发数
-				sem := make(chan struct{}, httpDetectionConcurrency()) // 使用配置的并发数
+				sem := make(chan struct{}, httpDetectionConcurrency) // 使用配置的并发数
 				var wg sync.WaitGroup
 				for _, port := range ports {
 					wg.Add(1)
