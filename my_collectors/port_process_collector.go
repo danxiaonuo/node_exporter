@@ -141,6 +141,14 @@ var firstScanCompleted = struct {
 	done bool
 }{done: false}
 
+// 强制重置首次检测状态（用于调试）
+func resetFirstScan() {
+	firstScanCompleted.Lock()
+	firstScanCompleted.done = false
+	firstScanCompleted.Unlock()
+	log.Printf("[DEBUG] 强制重置首次检测状态")
+}
+
 // 新增：HTTP检测异步处理器
 func startHTTPDetectionWorker() {
 	go func() {
@@ -352,6 +360,9 @@ var processAliveCache = &processAliveCacheStruct{
 // Collect 方法：实现 Prometheus Collector 接口，采集所有指标
 // TCP/UDP端口分别采集，指标名区分，HTTP端口单独采集
 func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
+	// 强制重置首次检测状态，确保能进行检测
+	resetFirstScan()
+
 	infos := getPortProcessInfo()                // 获取端口与进程列表（8小时刷新一次）
 	reportedProcessKeys := make(map[string]bool) // 记录已上报的进程，避免重复（基于进程名+路径）
 	tcpPortDone := make(map[int]bool)
