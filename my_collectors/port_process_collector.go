@@ -144,7 +144,7 @@ var firstScanCompleted = struct {
 // 新增：HTTP检测异步处理器
 func startHTTPDetectionWorker() {
 	go func() {
-		ticker := time.NewTicker(3 * time.Second) // 每3秒处理一次队列，平衡性能和响应速度
+		ticker := time.NewTicker(1 * time.Minute) // 每1分钟处理一次队列，减少资源消耗
 		defer ticker.Stop()
 		for {
 			select {
@@ -161,9 +161,6 @@ func startHTTPDetectionWorker() {
 				httpDetectionQueue.Unlock()
 
 				// 异步检测所有排队的端口，使用信号量控制并发数
-				if len(ports) > 0 {
-					log.Printf("[INFO] Worker开始处理 %d 个端口: %v", len(ports), ports)
-				}
 				sem := make(chan struct{}, httpDetectionConcurrency) // 使用配置的并发数
 				var wg sync.WaitGroup
 				for _, port := range ports {
@@ -174,7 +171,6 @@ func startHTTPDetectionWorker() {
 						defer func() { <-sem }()
 
 						status := checkPortHTTP(p)
-						log.Printf("[INFO] 端口 %d HTTP检测结果: %d", p, status)
 
 						httpStatusCache.RWMutex.Lock()
 						httpStatusCache.Status[p] = status
@@ -183,7 +179,6 @@ func startHTTPDetectionWorker() {
 							httpAliveHistory.Lock()
 							httpAliveHistory.Ports[p] = true
 							httpAliveHistory.Unlock()
-							log.Printf("[INFO] 端口 %d 已添加到HTTP历史记录", p)
 						}
 						httpStatusCache.RWMutex.Unlock()
 
@@ -207,7 +202,6 @@ func startHTTPDetectionWorker() {
 // 新增：初始化HTTP检测工作器
 func init() {
 	startHTTPDetectionWorker()
-	log.Printf("[INFO] HTTP检测工作器已启动")
 }
 
 var (
