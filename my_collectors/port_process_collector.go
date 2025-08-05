@@ -186,12 +186,15 @@ func startHTTPDetectionWorker() {
 				}
 				wg.Wait()
 
-				// 标记首次全量检测完成
-				firstScanCompleted.Lock()
-				if !firstScanCompleted.done {
-					firstScanCompleted.done = true
+				// 标记首次全量检测完成（只有当队列为空且没有端口需要检测时才完成）
+				if len(ports) == 0 {
+					firstScanCompleted.Lock()
+					if !firstScanCompleted.done {
+						firstScanCompleted.done = true
+						log.Printf("[DEBUG] 首次全量HTTP检测已完成")
+					}
+					firstScanCompleted.Unlock()
 				}
-				firstScanCompleted.Unlock()
 			}
 		}
 	}()
@@ -412,13 +415,14 @@ func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 							log.Printf("[DEBUG] 端口 %d: 首次检测，shouldDetect = true", info.Port)
 						}
 
-						// 后续检测：只对曾经HTTP成功的端口进行检测
+						// 后续检测：只要首次检测没完成，且还没检测到成功，就一直检测
 						if !shouldDetect {
 							httpAliveHistory.RLock()
 							everAlive := httpAliveHistory.Ports[info.Port]
 							httpAliveHistory.RUnlock()
-							shouldDetect = everAlive
-							log.Printf("[DEBUG] 端口 %d: 后续检测，everAlive = %v, shouldDetect = %v", info.Port, everAlive, shouldDetect)
+							// 只要首次检测没完成，且还没检测到成功，就一直检测
+							shouldDetect = !firstDone || everAlive
+							log.Printf("[DEBUG] 端口 %d: 后续检测，everAlive = %v, firstDone = %v, shouldDetect = %v", info.Port, everAlive, firstDone, shouldDetect)
 						}
 
 						if shouldDetect {
@@ -429,14 +433,12 @@ func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 							httpDetectionQueue.Unlock()
 
 							// 首次检测时，先暴露0，等检测结果出来后再更新
-							firstScanCompleted.RLock()
-							if !firstScanCompleted.done {
+							if !firstDone {
 								ch <- prometheus.MustNewConstMetric(
 									c.httpAliveDesc, prometheus.GaugeValue, 0, labels...,
 								)
 								log.Printf("[DEBUG] 端口 %d 首次检测，暴露HTTP指标: 0", info.Port)
 							}
-							firstScanCompleted.RUnlock()
 						} else {
 							log.Printf("[DEBUG] 端口 %d 不需要检测", info.Port)
 						}
