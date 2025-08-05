@@ -402,10 +402,15 @@ func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 
 						// 首次全量检测：对所有TCP端口进行HTTP检测
 						firstScanCompleted.RLock()
-						if !firstScanCompleted.done {
-							shouldDetect = true
-						}
+						firstDone := firstScanCompleted.done
 						firstScanCompleted.RUnlock()
+
+						log.Printf("[DEBUG] 端口 %d: firstScanCompleted.done = %v", info.Port, firstDone)
+
+						if !firstDone {
+							shouldDetect = true
+							log.Printf("[DEBUG] 端口 %d: 首次检测，shouldDetect = true", info.Port)
+						}
 
 						// 后续检测：只对曾经HTTP成功的端口进行检测
 						if !shouldDetect {
@@ -413,6 +418,7 @@ func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 							everAlive := httpAliveHistory.Ports[info.Port]
 							httpAliveHistory.RUnlock()
 							shouldDetect = everAlive
+							log.Printf("[DEBUG] 端口 %d: 后续检测，everAlive = %v, shouldDetect = %v", info.Port, everAlive, shouldDetect)
 						}
 
 						if shouldDetect {
