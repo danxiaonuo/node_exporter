@@ -135,6 +135,20 @@ var httpDetectionQueue = struct {
 	done  chan struct{}
 }{ports: make(map[int]bool), done: make(chan struct{})}
 
+// 新增：TCP检测异步化，避免阻塞指标暴露
+var tcpDetectionQueue = struct {
+	sync.Mutex
+	ports map[int]bool
+	done  chan struct{}
+}{ports: make(map[int]bool), done: make(chan struct{})}
+
+// 新增：进程检测异步化，避免阻塞指标暴露
+var processDetectionQueue = struct {
+	sync.Mutex
+	pids map[int]bool
+	done chan struct{}
+}{pids: make(map[int]bool), done: make(chan struct{})}
+
 // 新增：记录是否已完成首次全量检测
 var firstScanCompleted = struct {
 	sync.RWMutex
@@ -167,6 +181,12 @@ func startHTTPDetectionWorker() {
 					wg.Add(1)
 					go func(p int) {
 						defer wg.Done()
+						defer func() {
+							if r := recover(); r != nil {
+								log.Printf("[port_process_collector] HTTP检测panic恢复: port=%d, error=%v", p, r)
+							}
+						}()
+
 						sem <- struct{}{}
 						defer func() { <-sem }()
 
@@ -199,9 +219,116 @@ func startHTTPDetectionWorker() {
 	}()
 }
 
-// 新增：初始化HTTP检测工作器
+// 新增：TCP检测异步处理器
+func startTCPDetectionWorker() {
+	go func() {
+		ticker := time.NewTicker(portStatusInterval) // 使用TCP检测间隔
+		defer ticker.Stop()
+		for {
+			select {
+			case <-tcpDetectionQueue.done:
+				return
+			case <-ticker.C:
+				tcpDetectionQueue.Lock()
+				ports := make([]int, 0, len(tcpDetectionQueue.ports))
+				for port := range tcpDetectionQueue.ports {
+					ports = append(ports, port)
+				}
+				// 清空队列
+				tcpDetectionQueue.ports = make(map[int]bool)
+				tcpDetectionQueue.Unlock()
+
+				// 异步检测所有排队的端口
+				sem := make(chan struct{}, maxParallelIPChecks)
+				var wg sync.WaitGroup
+				for _, port := range ports {
+					wg.Add(1)
+					go func(p int) {
+						defer wg.Done()
+						defer func() {
+							if r := recover(); r != nil {
+								log.Printf("[port_process_collector] TCP检测panic恢复: port=%d, error=%v", p, r)
+							}
+						}()
+
+						sem <- struct{}{}
+						defer func() { <-sem }()
+
+						// 快速模式下使用更短的超时时间
+						var alive int
+						var respTime float64
+						if fastMode {
+							alive, respTime = checkPortTCPWithTimeout(p, 500*time.Millisecond)
+						} else {
+							alive, respTime = checkPortTCP(p)
+						}
+
+						portStatusCache.RWMutex.Lock()
+						portStatusCache.Status[p] = alive
+						portStatusCache.RespTime[p] = respTime
+						portStatusCache.LastCheck[p] = time.Now()
+						portStatusCache.RWMutex.Unlock()
+
+					}(port)
+				}
+				wg.Wait()
+			}
+		}
+	}()
+}
+
+// 新增：进程检测异步处理器
+func startProcessDetectionWorker() {
+	go func() {
+		ticker := time.NewTicker(processAliveStatusInterval) // 使用进程检测间隔
+		defer ticker.Stop()
+		for {
+			select {
+			case <-processDetectionQueue.done:
+				return
+			case <-ticker.C:
+				processDetectionQueue.Lock()
+				pids := make([]int, 0, len(processDetectionQueue.pids))
+				for pid := range processDetectionQueue.pids {
+					pids = append(pids, pid)
+				}
+				// 清空队列
+				processDetectionQueue.pids = make(map[int]bool)
+				processDetectionQueue.Unlock()
+
+				// 异步检测所有排队的进程
+				var wg sync.WaitGroup
+				for _, pid := range pids {
+					wg.Add(1)
+					go func(p int) {
+						defer wg.Done()
+						defer func() {
+							if r := recover(); r != nil {
+								log.Printf("[port_process_collector] 进程检测panic恢复: pid=%d, error=%v", p, r)
+							}
+						}()
+
+						status := checkProcess(p)
+						key := getPidKey(p)
+
+						processAliveCache.RWMutex.Lock()
+						processAliveCache.Status[key] = status
+						processAliveCache.LastCheck[key] = time.Now()
+						processAliveCache.RWMutex.Unlock()
+
+					}(pid)
+				}
+				wg.Wait()
+			}
+		}
+	}()
+}
+
+// 新增：初始化所有异步检测工作器
 func init() {
 	startHTTPDetectionWorker()
+	startTCPDetectionWorker()
+	startProcessDetectionWorker()
 }
 
 var (
@@ -231,7 +358,7 @@ var (
 				return d
 			}
 		}
-		return 5 * time.Minute // 默认5分钟，避免频繁检测
+		return 5 * time.Minute // 完全异步检测下，保持较长的缓存时间
 	}()
 	// 新增 UDP 检测缓存周期
 	udpStatusInterval = func() time.Duration {
@@ -298,7 +425,7 @@ var (
 				return d
 			}
 		}
-		return 30 * time.Second // 默认30秒处理一次队列，提高响应速度
+		return 30 * time.Second // 完全异步检测下，30秒处理一次即可
 	}()
 	// 新增：快速模式配置，减少指标暴露时间
 	fastMode = func() bool {
@@ -904,32 +1031,32 @@ func (c *PortProcessCollector) Update(ch chan<- prometheus.Metric) error {
 	return nil
 }
 
+// 带缓存的TCP端口存活检测（完全异步化，避免阻塞指标暴露）
 func getPortStatus(port int) (alive int, respTime float64) {
 	portStatusCache.RWMutex.RLock()
 	now := time.Now()
 	t, ok := portStatusCache.LastCheck[port]
 	if !ok || now.Sub(t) > portStatusInterval {
 		portStatusCache.RWMutex.RUnlock()
-		portStatusCache.RWMutex.Lock()
-		// 再次检查，防止并发下重复写
-		t, ok = portStatusCache.LastCheck[port]
-		if !ok || now.Sub(t) > portStatusInterval {
-			// 快速模式下使用更短的超时时间
-			if fastMode {
-				// 在快速模式下，使用更短的超时时间进行检测
-				alive, respTime = checkPortTCPWithTimeout(port, 500*time.Millisecond)
-			} else {
-				alive, respTime = checkPortTCP(port)
-			}
-			portStatusCache.Status[port] = alive
-			portStatusCache.RespTime[port] = respTime
-			portStatusCache.LastCheck[port] = now
-		} else {
-			alive = portStatusCache.Status[port]
-			respTime = portStatusCache.RespTime[port]
+
+		// 缓存过期，加入TCP异步检测队列
+		tcpDetectionQueue.Lock()
+		tcpDetectionQueue.ports[port] = true
+		tcpDetectionQueue.Unlock()
+
+		// 缓存过期，使用历史状态作为临时值，避免阻塞
+		portStatusCache.RWMutex.RLock()
+		if lastAlive, exists := portStatusCache.Status[port]; exists {
+			lastRespTime := portStatusCache.RespTime[port]
+			portStatusCache.RWMutex.RUnlock()
+
+			// 使用上次检测结果作为临时值
+			return lastAlive, lastRespTime
 		}
-		portStatusCache.RWMutex.Unlock()
-		return
+		portStatusCache.RWMutex.RUnlock()
+
+		// 没有历史记录，返回默认值
+		return 0, 0
 	}
 	alive = portStatusCache.Status[port]
 	respTime = portStatusCache.RespTime[port]
@@ -937,26 +1064,34 @@ func getPortStatus(port int) (alive int, respTime float64) {
 	return
 }
 
-// 新增：带缓存的 HTTP 检测
+// 带缓存的HTTP端口存活检测（完全异步化，避免阻塞指标暴露）
 func getPortHTTPStatus(port int) int {
 	httpStatusCache.RWMutex.RLock()
 	now := time.Now()
 	t, ok := httpStatusCache.LastCheck[port]
 	if !ok || now.Sub(t) > httpStatusInterval {
 		httpStatusCache.RWMutex.RUnlock()
-		httpStatusCache.RWMutex.Lock()
-		t, ok = httpStatusCache.LastCheck[port]
-		if !ok || now.Sub(t) > httpStatusInterval {
-			status := checkPortHTTP(port)
-			httpStatusCache.Status[port] = status
-			httpStatusCache.LastCheck[port] = now
-			httpStatusCache.RWMutex.Unlock()
-			return status
-		} else {
-			status := httpStatusCache.Status[port]
-			httpStatusCache.RWMutex.Unlock()
-			return status
+		// 缓存过期，加入异步检测队列
+		httpDetectionQueue.Lock()
+		httpDetectionQueue.ports[port] = true
+		httpDetectionQueue.Unlock()
+
+		// 使用历史状态作为临时值，避免阻塞
+		httpAliveHistory.RLock()
+		everAlive := httpAliveHistory.Ports[port]
+		httpAliveHistory.RUnlock()
+
+		if everAlive {
+			// 曾经HTTP成功过，使用历史状态
+			httpStatusCache.RWMutex.RLock()
+			if lastStatus, exists := httpStatusCache.Status[port]; exists {
+				httpStatusCache.RWMutex.RUnlock()
+				return lastStatus
+			}
+			httpStatusCache.RWMutex.RUnlock()
+			return 1 // 有历史记录但无缓存，假设为存活
 		}
+		return 0 // 无历史记录，返回0
 	}
 	status := httpStatusCache.Status[port]
 	httpStatusCache.RWMutex.RUnlock()
@@ -996,6 +1131,33 @@ func cleanStalePortCaches(infos []PortProcessInfo) {
 		activePorts[info.Port] = true
 		activePidKeys[getPidKey(info.Pid)] = true
 	}
+
+	// 清理异步检测队列中的过期端口和进程
+	httpDetectionQueue.Lock()
+	for port := range httpDetectionQueue.ports {
+		if !activePorts[port] {
+			delete(httpDetectionQueue.ports, port)
+		}
+	}
+	httpDetectionQueue.Unlock()
+
+	tcpDetectionQueue.Lock()
+	for port := range tcpDetectionQueue.ports {
+		if !activePorts[port] {
+			delete(tcpDetectionQueue.ports, port)
+		}
+	}
+	tcpDetectionQueue.Unlock()
+
+	processDetectionQueue.Lock()
+	for pid := range processDetectionQueue.pids {
+		key := getPidKey(pid)
+		if !activePidKeys[key] {
+			delete(processDetectionQueue.pids, pid)
+		}
+	}
+	processDetectionQueue.Unlock()
+
 	// 清理 httpAliveHistory
 	httpAliveHistory.Lock()
 	for port := range httpAliveHistory.Ports {
@@ -1004,6 +1166,7 @@ func cleanStalePortCaches(infos []PortProcessInfo) {
 		}
 	}
 	httpAliveHistory.Unlock()
+
 	// 清理 portStatusCache
 	portStatusCache.RWMutex.Lock()
 	for port := range portStatusCache.Status {
@@ -1014,6 +1177,7 @@ func cleanStalePortCaches(infos []PortProcessInfo) {
 		}
 	}
 	portStatusCache.RWMutex.Unlock()
+
 	// 清理 udpStatusCache
 	udpStatusCache.RWMutex.Lock()
 	for port := range udpStatusCache.Status {
@@ -1023,6 +1187,7 @@ func cleanStalePortCaches(infos []PortProcessInfo) {
 		}
 	}
 	udpStatusCache.RWMutex.Unlock()
+
 	// 清理 httpStatusCache
 	httpStatusCache.RWMutex.Lock()
 	for port := range httpStatusCache.Status {
@@ -1032,6 +1197,7 @@ func cleanStalePortCaches(infos []PortProcessInfo) {
 		}
 	}
 	httpStatusCache.RWMutex.Unlock()
+
 	// 清理进程存活缓存
 	processAliveCache.RWMutex.Lock()
 	for key := range processAliveCache.Status {
@@ -1043,7 +1209,7 @@ func cleanStalePortCaches(infos []PortProcessInfo) {
 	processAliveCache.RWMutex.Unlock()
 }
 
-// 带缓存的进程存活检测
+// 带缓存的进程存活检测（完全异步化，避免阻塞指标暴露）
 func getProcessAliveStatus(pid int) int {
 	key := getPidKey(pid)
 	processAliveCache.RWMutex.RLock()
@@ -1051,19 +1217,24 @@ func getProcessAliveStatus(pid int) int {
 	t, ok := processAliveCache.LastCheck[key]
 	if !ok || now.Sub(t) > processAliveStatusInterval {
 		processAliveCache.RWMutex.RUnlock()
-		processAliveCache.RWMutex.Lock()
-		t, ok = processAliveCache.LastCheck[key]
-		if !ok || now.Sub(t) > processAliveStatusInterval {
-			status := checkProcess(pid)
-			processAliveCache.Status[key] = status
-			processAliveCache.LastCheck[key] = now
-			processAliveCache.RWMutex.Unlock()
-			return status
-		} else {
-			status := processAliveCache.Status[key]
-			processAliveCache.RWMutex.Unlock()
-			return status
+
+		// 缓存过期，加入进程异步检测队列
+		processDetectionQueue.Lock()
+		processDetectionQueue.pids[pid] = true
+		processDetectionQueue.Unlock()
+
+		// 缓存过期，使用历史状态作为临时值，避免阻塞
+		processAliveCache.RWMutex.RLock()
+		if lastStatus, exists := processAliveCache.Status[key]; exists {
+			processAliveCache.RWMutex.RUnlock()
+
+			// 使用上次检测结果作为临时值
+			return lastStatus
 		}
+		processAliveCache.RWMutex.RUnlock()
+
+		// 没有历史记录，返回默认值
+		return 0
 	}
 	status := processAliveCache.Status[key]
 	processAliveCache.RWMutex.RUnlock()

@@ -6,10 +6,19 @@
 
 ### 核心配置
 
-| 变量名 | 默认值 | 说明 |
-|--------|--------|------|
+| 环境变量 | 默认值 | 说明 |
+|---------|--------|------|
+| `PORT_CHECK_TIMEOUT` | `3s` | 端口检测超时时间 |
+| `PORT_STATUS_INTERVAL` | `30s` | TCP端口状态检测间隔 |
+| `PORT_HTTP_STATUS_INTERVAL` | `5m` | HTTP端口状态检测间隔（完全异步检测） |
+| `PORT_UDP_STATUS_INTERVAL` | `30s` | UDP端口状态检测间隔 |
+| `PROCESS_ALIVE_STATUS_INTERVAL` | `1m` | 进程存活状态检测间隔 |
 | `PORT_LABEL_INTERVAL` | `8h` | 端口和进程发现扫描间隔（多久刷新一次端口及其关联进程的列表） |
-| `PROC_PREFIX` | 自动检测 | /proc 文件系统路径前缀（自动检测 Docker/Kubernetes 容器） |
+| `MAX_PARALLEL_IP_CHECKS` | `8` | 最大并发端口检测数 |
+| `ENABLE_HTTP_DETECTION` | `true` | 是否启用HTTP检测 |
+| `HTTP_DETECTION_CONCURRENCY` | `10` | HTTP检测并发数 |
+| `HTTP_DETECTION_INTERVAL` | `30s` | HTTP检测工作器处理间隔（完全异步） |
+| `PROC_PREFIX` | 自动检测 | 容器环境下的/proc路径前缀 |
 
 ### 端口状态检测
 

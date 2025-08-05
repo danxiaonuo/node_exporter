@@ -122,24 +122,20 @@ func (c *MyCollector) Collect(ch chan<- prometheus.Metric) {
 
 ## 环境变量与配置
 
-| 变量名 | 说明 | 默认值 |
-|--------|------|--------|
-| PORT_LABEL_INTERVAL | 端口-进程标签发现周期 | 8h |
-| PORT_STATUS_INTERVAL | TCP端口检测周期 | 1m |
-| PORT_HTTP_STATUS_INTERVAL | HTTP端口检测周期 | 5m |
-| HTTP_DETECTION_INTERVAL | HTTP检测工作器处理间隔 | 1m |
-| HTTP_DETECTION_CONCURRENCY | HTTP检测并发数 | 10 |
-| ENABLE_HTTP_DETECTION | 是否启用HTTP检测 | true |
-| FAST_MODE | 快速模式，减少超时时间以加快指标暴露速度 | false |
-| PORT_UDP_STATUS_INTERVAL | UDP端口检测周期 | 1m |
-| PROCESS_ALIVE_STATUS_INTERVAL | 进程检测周期 | 1m |
-| PORT_CHECK_TIMEOUT | 端口检测超时时间 | 3s |
-| MAX_PARALLEL_IP_CHECKS | 端口检测最大并发数 | 8 |
-| EXCLUDED_PROCESS_NAMES | 排除进程名（逗号分隔） | - |
-| PROC_PREFIX | 容器下 /proc 路径前缀 | 自动判断 |
-| HARDWARE_INFO_INTERVAL | 硬件信息采集周期 | 8h |
-| NETWORK_INTERFACE_INTERVAL | 网卡信息采集周期 | 8h |
-| LOGIN_FAILED_INTERVAL | 登录失败采集周期 | 1m |
+| 环境变量 | 默认值 | 说明 |
+|---------|--------|------|
+| `PORT_CHECK_TIMEOUT` | `3s` | 端口检测超时时间 |
+| `PORT_STATUS_INTERVAL` | `30s` | TCP端口状态检测间隔 |
+| `PORT_HTTP_STATUS_INTERVAL` | `5m` | HTTP端口状态检测间隔（完全异步检测） |
+| `PORT_UDP_STATUS_INTERVAL` | `30s` | UDP端口状态检测间隔 |
+| `PROCESS_ALIVE_STATUS_INTERVAL` | `1m` | 进程存活状态检测间隔 |
+| `PORT_LABEL_INTERVAL` | `8h` | 端口和进程发现扫描间隔 |
+| `MAX_PARALLEL_IP_CHECKS` | `8` | 最大并发端口检测数 |
+| `ENABLE_HTTP_DETECTION` | `true` | 是否启用HTTP检测 |
+| `HTTP_DETECTION_CONCURRENCY` | `10` | HTTP检测并发数 |
+| `HTTP_DETECTION_INTERVAL` | `30s` | HTTP检测工作器处理间隔（完全异步） |
+| `FAST_MODE` | `true` | 快速模式（减少TCP检测超时） |
+| `PROC_PREFIX` | 自动检测 | 容器环境下的/proc路径前缀 |
 
 ---
 
