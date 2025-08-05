@@ -127,7 +127,7 @@ func (c *MyCollector) Collect(ch chan<- prometheus.Metric) {
 | `PORT_CHECK_TIMEOUT` | `3s` | 端口检测超时时间 |
 | `PORT_STATUS_INTERVAL` | `30s` | TCP端口状态检测间隔 |
 | `PORT_HTTP_STATUS_INTERVAL` | `5m` | HTTP端口状态检测间隔（完全异步检测） |
-| `PORT_UDP_STATUS_INTERVAL` | `30s` | UDP端口状态检测间隔 |
+| `PORT_UDP_STATUS_INTERVAL` | `30s` | UDP端口状态检测间隔（完全异步检测） |
 | `PROCESS_ALIVE_STATUS_INTERVAL` | `1m` | 进程存活状态检测间隔 |
 | `PORT_LABEL_INTERVAL` | `8h` | 端口和进程发现扫描间隔 |
 | `MAX_PARALLEL_IP_CHECKS` | `8` | 最大并发端口检测数 |

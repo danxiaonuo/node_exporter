@@ -35,8 +35,14 @@
 |--------|--------|------|
 | `ENABLE_HTTP_DETECTION` | `true` | 是否启用 HTTP 端口检测 |
 | `PORT_HTTP_STATUS_INTERVAL` | `5m` | HTTP 端口状态检查缓存间隔 |
-| `HTTP_DETECTION_INTERVAL` | `1m` | HTTP 检测工作器处理间隔 |
+| `HTTP_DETECTION_INTERVAL` | `30s` | HTTP 检测工作器处理间隔 |
 | `HTTP_DETECTION_CONCURRENCY` | `10` | HTTP 检测并发工作器数量 |
+
+### UDP 检测
+
+| 变量名 | 默认值 | 说明 |
+|--------|--------|------|
+| `PORT_UDP_STATUS_INTERVAL` | `30s` | UDP 端口状态检查缓存间隔（完全异步检测） |
 
 ### 性能优化
 

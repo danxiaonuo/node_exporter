@@ -149,11 +149,12 @@ var processDetectionQueue = struct {
 	done chan struct{}
 }{pids: make(map[int]bool), done: make(chan struct{})}
 
-// 新增：记录是否已完成首次全量检测
-var firstScanCompleted = struct {
-	sync.RWMutex
-	done bool
-}{done: false}
+// 新增：UDP检测异步化，避免阻塞指标暴露
+var udpDetectionQueue = struct {
+	sync.Mutex
+	ports map[int]bool
+	done  chan struct{}
+}{ports: make(map[int]bool), done: make(chan struct{})}
 
 // 新增：HTTP检测异步处理器
 func startHTTPDetectionWorker() {
@@ -205,15 +206,6 @@ func startHTTPDetectionWorker() {
 					}(port)
 				}
 				wg.Wait()
-
-				// 标记首次全量检测完成（处理完所有端口后完成）
-				if len(ports) > 0 {
-					firstScanCompleted.Lock()
-					if !firstScanCompleted.done {
-						firstScanCompleted.done = true
-					}
-					firstScanCompleted.Unlock()
-				}
 			}
 		}
 	}()
@@ -324,11 +316,59 @@ func startProcessDetectionWorker() {
 	}()
 }
 
+// 新增：UDP检测异步处理器
+func startUDPDetectionWorker() {
+	go func() {
+		ticker := time.NewTicker(udpStatusInterval) // 使用UDP检测间隔
+		defer ticker.Stop()
+		for {
+			select {
+			case <-udpDetectionQueue.done:
+				return
+			case <-ticker.C:
+				udpDetectionQueue.Lock()
+				ports := make([]int, 0, len(udpDetectionQueue.ports))
+				for port := range udpDetectionQueue.ports {
+					ports = append(ports, port)
+				}
+				// 清空队列
+				udpDetectionQueue.ports = make(map[int]bool)
+				udpDetectionQueue.Unlock()
+
+				// 异步检测所有排队的UDP端口
+				var wg sync.WaitGroup
+				for _, port := range ports {
+					wg.Add(1)
+					go func(p int) {
+						defer wg.Done()
+						defer func() {
+							if r := recover(); r != nil {
+								log.Printf("[port_process_collector] UDP检测panic恢复: port=%d, error=%v", p, r)
+							}
+						}()
+
+						// UDP检测：检查端口是否在监听（基于/proc/net/udp）
+						status := checkUDPPort(p)
+
+						udpStatusCache.RWMutex.Lock()
+						udpStatusCache.Status[p] = status
+						udpStatusCache.LastCheck[p] = time.Now()
+						udpStatusCache.RWMutex.Unlock()
+
+					}(port)
+				}
+				wg.Wait()
+			}
+		}
+	}()
+}
+
 // 新增：初始化所有异步检测工作器
 func init() {
 	startHTTPDetectionWorker()
 	startTCPDetectionWorker()
 	startProcessDetectionWorker()
+	startUDPDetectionWorker()
 }
 
 var (
@@ -340,15 +380,6 @@ var (
 			}
 		}
 		return 30 * time.Second // 减少到30秒，提高缓存命中率
-	}()
-	portLabelInterval = func() time.Duration {
-		if v := os.Getenv("PORT_LABEL_INTERVAL"); v != "" {
-			d, err := time.ParseDuration(v)
-			if err == nil {
-				return d
-			}
-		}
-		return 8 * time.Hour
 	}()
 	// 新增 HTTP 检测缓存周期
 	httpStatusInterval = func() time.Duration {
@@ -507,28 +538,19 @@ func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 			if !tcpPortDone[info.Port] {
 				// TCP端口存活和响应时间（快速检测，不阻塞）
 				alive, respTime := getPortStatus(info.Port)
-				ch <- prometheus.MustNewConstMetric(
-					c.portTCPAliveDesc, prometheus.GaugeValue, float64(alive), labels...,
-				)
-				ch <- prometheus.MustNewConstMetric(
-					c.portTCPRespDesc, prometheus.GaugeValue, respTime, labels...,
-				)
-
+				if alive >= 0 { // 只暴露有效的TCP状态（>=0）
+					ch <- prometheus.MustNewConstMetric(
+						c.portTCPAliveDesc, prometheus.GaugeValue, float64(alive), labels...,
+					)
+					ch <- prometheus.MustNewConstMetric(
+						c.portTCPRespDesc, prometheus.GaugeValue, respTime, labels...,
+					)
+				}
+				// alive == -1 表示暂时不暴露指标，等待异步检测完成
 				// HTTP检测优化：简化逻辑，减少锁竞争
 				if enableHTTPDetection {
-					// 快速检查缓存
-					httpStatusCache.RWMutex.RLock()
-					now := time.Now()
-					t, ok := httpStatusCache.LastCheck[info.Port]
-					hasCache := ok && now.Sub(t) <= httpStatusInterval
-					httpStatusCache.RWMutex.RUnlock()
-
-					if hasCache {
-						// 有缓存结果，直接使用
-						httpStatusCache.RWMutex.RLock()
-						httpAlive := httpStatusCache.Status[info.Port]
-						httpStatusCache.RWMutex.RUnlock()
-
+					httpStatus := getPortHTTPStatus(info.Port)
+					if httpStatus >= 0 { // 只暴露有效的HTTP状态（>=0）
 						// 只暴露曾经HTTP成功的端口
 						httpAliveHistory.RLock()
 						everAlive := httpAliveHistory.Ports[info.Port]
@@ -536,47 +558,23 @@ func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 
 						if everAlive {
 							ch <- prometheus.MustNewConstMetric(
-								c.httpAliveDesc, prometheus.GaugeValue, float64(httpAlive), labels...,
+								c.httpAliveDesc, prometheus.GaugeValue, float64(httpStatus), labels...,
 							)
 						}
-					} else {
-						// HTTP检测逻辑：缓存过期时加入异步检测队列
-						httpDetectionQueue.Lock()
-						httpDetectionQueue.ports[info.Port] = true
-						httpDetectionQueue.Unlock()
-
-						// 智能回退策略：优先使用历史状态，避免指标跳跃
-						httpAliveHistory.RLock()
-						everAlive := httpAliveHistory.Ports[info.Port]
-						httpAliveHistory.RUnlock()
-
-						if everAlive {
-							// 曾经HTTP成功过，使用历史状态作为临时值
-							httpStatusCache.RWMutex.RLock()
-							if lastStatus, exists := httpStatusCache.Status[info.Port]; exists {
-								// 使用上次的检测结果作为临时值
-								ch <- prometheus.MustNewConstMetric(
-									c.httpAliveDesc, prometheus.GaugeValue, float64(lastStatus), labels...,
-								)
-							} else {
-								// 没有缓存但有历史记录，假设为存活状态
-								ch <- prometheus.MustNewConstMetric(
-									c.httpAliveDesc, prometheus.GaugeValue, 1, labels...,
-								)
-							}
-							httpStatusCache.RWMutex.RUnlock()
-						}
-						// 如果没有历史记录，则不暴露HTTP指标，等待异步检测完成
 					}
+					// httpStatus == -1 表示暂时不暴露指标，等待异步检测完成
 				}
 				tcpPortDone[info.Port] = true
 			}
 		} else if info.Protocol == "udp" {
 			if !udpPortDone[info.Port] {
 				alive := getPortUDPStatus(info.Port, 1)
-				ch <- prometheus.MustNewConstMetric(
-					c.portUDPAliveDesc, prometheus.GaugeValue, float64(alive), labels...,
-				)
+				if alive >= 0 { // 只暴露有效的UDP状态（>=0）
+					ch <- prometheus.MustNewConstMetric(
+						c.portUDPAliveDesc, prometheus.GaugeValue, float64(alive), labels...,
+					)
+				}
+				// alive == -1 表示暂时不暴露指标，等待异步检测完成
 				udpPortDone[info.Port] = true
 			}
 		}
@@ -584,10 +582,13 @@ func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 		processKey := info.ProcessName + "|" + info.ExePath
 		if !reportedProcessKeys[processKey] {
 			procAlive := getProcessAliveStatus(info.Pid)
-			ch <- prometheus.MustNewConstMetric(
-				c.processAliveDesc, prometheus.GaugeValue, float64(procAlive),
-				info.ProcessName, info.ExePath,
-			)
+			if procAlive >= 0 { // 只暴露有效的进程状态（>=0）
+				ch <- prometheus.MustNewConstMetric(
+					c.processAliveDesc, prometheus.GaugeValue, float64(procAlive),
+					info.ProcessName, info.ExePath,
+				)
+			}
+			// procAlive == -1 表示暂时不暴露指标，等待异步检测完成
 			reportedProcessKeys[processKey] = true
 		}
 	}
@@ -940,6 +941,28 @@ func checkPortHTTPWithTimeout(port int, timeout time.Duration) int {
 	return 0
 }
 
+// checkUDPPort 函数：检测UDP端口是否在监听
+// 通过检查 /proc/net/udp 和 /proc/net/udp6 来判断端口是否在监听
+func checkUDPPort(port int) int {
+	// 检查IPv4 UDP端口
+	tcpInodePort := parseInodePortMap([]string{"/proc/net/udp"}, "udp")
+	for _, p := range tcpInodePort {
+		if p == port {
+			return 1
+		}
+	}
+
+	// 检查IPv6 UDP端口
+	udpInodePort := parseInodePortMap([]string{"/proc/net/udp6"}, "udp")
+	for _, p := range udpInodePort {
+		if p == port {
+			return 1
+		}
+	}
+
+	return 0
+}
+
 // checkProcess 函数：检测进程是否存活
 // 只要 /proc/<pid> 目录存在即认为进程存活
 func checkProcess(pid int) int {
@@ -1055,8 +1078,8 @@ func getPortStatus(port int) (alive int, respTime float64) {
 		}
 		portStatusCache.RWMutex.RUnlock()
 
-		// 没有历史记录，返回默认值
-		return 0, 0
+		// 没有历史记录，不暴露指标，等待异步检测完成
+		return -1, -1 // 使用-1表示暂时不暴露指标
 	}
 	alive = portStatusCache.Status[port]
 	respTime = portStatusCache.RespTime[port]
@@ -1091,32 +1114,39 @@ func getPortHTTPStatus(port int) int {
 			httpStatusCache.RWMutex.RUnlock()
 			return 1 // 有历史记录但无缓存，假设为存活
 		}
-		return 0 // 无历史记录，返回0
+		// 无历史记录，不暴露HTTP指标，等待异步检测完成
+		return -1 // 使用-1表示暂时不暴露指标
 	}
 	status := httpStatusCache.Status[port]
 	httpStatusCache.RWMutex.RUnlock()
 	return status
 }
 
-// 带缓存的UDP端口存活检测（仍以fd存在为准）
+// 带缓存的UDP端口存活检测（完全异步化，避免阻塞指标暴露）
 func getPortUDPStatus(port int, exist int) int {
 	udpStatusCache.RWMutex.RLock()
 	now := time.Now()
 	t, ok := udpStatusCache.LastCheck[port]
 	if !ok || now.Sub(t) > udpStatusInterval {
 		udpStatusCache.RWMutex.RUnlock()
-		udpStatusCache.RWMutex.Lock()
-		t, ok = udpStatusCache.LastCheck[port]
-		if !ok || now.Sub(t) > udpStatusInterval {
-			udpStatusCache.Status[port] = exist
-			udpStatusCache.LastCheck[port] = now
-			udpStatusCache.RWMutex.Unlock()
-			return exist
-		} else {
-			status := udpStatusCache.Status[port]
-			udpStatusCache.RWMutex.Unlock()
-			return status
+
+		// 缓存过期，加入UDP异步检测队列
+		udpDetectionQueue.Lock()
+		udpDetectionQueue.ports[port] = true
+		udpDetectionQueue.Unlock()
+
+		// 缓存过期，使用历史状态作为临时值，避免阻塞
+		udpStatusCache.RWMutex.RLock()
+		if lastStatus, exists := udpStatusCache.Status[port]; exists {
+			udpStatusCache.RWMutex.RUnlock()
+
+			// 使用上次检测结果作为临时值
+			return lastStatus
 		}
+		udpStatusCache.RWMutex.RUnlock()
+
+		// 没有历史记录，不暴露指标，等待异步检测完成
+		return -1 // 使用-1表示暂时不暴露指标
 	}
 	status := udpStatusCache.Status[port]
 	udpStatusCache.RWMutex.RUnlock()
@@ -1157,6 +1187,14 @@ func cleanStalePortCaches(infos []PortProcessInfo) {
 		}
 	}
 	processDetectionQueue.Unlock()
+
+	udpDetectionQueue.Lock()
+	for port := range udpDetectionQueue.ports {
+		if !activePorts[port] {
+			delete(udpDetectionQueue.ports, port)
+		}
+	}
+	udpDetectionQueue.Unlock()
 
 	// 清理 httpAliveHistory
 	httpAliveHistory.Lock()
@@ -1233,8 +1271,8 @@ func getProcessAliveStatus(pid int) int {
 		}
 		processAliveCache.RWMutex.RUnlock()
 
-		// 没有历史记录，返回默认值
-		return 0
+		// 没有历史记录，不暴露指标，等待异步检测完成
+		return -1 // 使用-1表示暂时不暴露指标
 	}
 	status := processAliveCache.Status[key]
 	processAliveCache.RWMutex.RUnlock()
