@@ -175,7 +175,7 @@ func startHTTPDetectionWorker() {
 				httpDetectionQueue.ports = make(map[int]bool)
 				httpDetectionQueue.Unlock()
 
-				// 异步检测所有排队的端口，使用信号量控制并发数
+								// 异步检测所有排队的端口，使用信号量控制并发数
 				sem := make(chan struct{}, httpDetectionConcurrency) // 使用配置的并发数
 				var wg sync.WaitGroup
 				for _, port := range ports {
@@ -372,6 +372,8 @@ func startUDPDetectionWorker() {
 	}()
 }
 
+
+
 // 新增：初始化所有异步检测工作器
 func init() {
 	startHTTPDetectionWorker()
@@ -447,6 +449,17 @@ var (
 		}
 		return true // 默认启用
 	}()
+
+		// 新增：是否启用智能协议检测的环境变量
+	enableSmartProtocolDetection = func() bool {
+		if v := os.Getenv("ENABLE_SMART_PROTOCOL_DETECTION"); v != "" {
+			enabled, err := strconv.ParseBool(v)
+			if err == nil {
+				return enabled
+			}
+		}
+		return true // 默认启用智能协议检测
+	}()
 	// 新增：HTTP检测并发数配置
 	httpDetectionConcurrency = func() int {
 		if v := os.Getenv("HTTP_DETECTION_CONCURRENCY"); v != "" {
@@ -466,6 +479,17 @@ var (
 			}
 		}
 		return 30 * time.Second // 完全异步检测下，30秒处理一次即可
+	}()
+
+	// 新增：HTTP检测超时时间配置（更短的超时时间，避免长时间阻塞）
+	httpDetectionTimeout = func() time.Duration {
+		if v := os.Getenv("HTTP_DETECTION_TIMEOUT"); v != "" {
+			d, err := time.ParseDuration(v)
+			if err == nil {
+				return d
+			}
+		}
+		return 2 * time.Second // 默认2秒超时，快速失败
 	}()
 	// 新增：快速模式配置，减少指标暴露时间
 	fastMode = func() bool {
@@ -556,7 +580,7 @@ func (c *PortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 					)
 				}
 				// alive == -1 表示暂时不暴露指标，等待异步检测完成
-				// HTTP检测优化：简化逻辑，减少锁竞争
+				// HTTP检测优化：只对TCP端口进行HTTP检测
 				if enableHTTPDetection {
 					httpStatus := getPortHTTPStatus(info.Port)
 					if httpStatus >= 0 { // 只暴露有效的HTTP状态（>=0）
@@ -878,10 +902,10 @@ func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTi
 // 1. 先串行检测常用地址（127.0.0.1、0.0.0.0、::1、::），极快返回常见监听场景
 // 2. 若全部不通，再对所有本地IP（IPv4/IPv6）做有限并发检测（最大maxParallelIPChecks），一旦有一个成功立即返回
 // 3. 并发控制用信号量，防止极端大规模主机拖垮性能
-// 4. 检测超时时间可通过PORT_CHECK_TIMEOUT配置，默认1分钟
+// 4. 检测超时时间可通过HTTP_DETECTION_TIMEOUT配置，默认2秒
 // 返回值：1=HTTP服务可访问，0=不可访问
 func checkPortHTTP(port int) int {
-	return checkPortHTTPWithTimeout(port, portCheckTimeout)
+	return checkPortHTTPWithTimeout(port, httpDetectionTimeout)
 }
 
 func checkPortHTTPWithTimeout(port int, timeout time.Duration) int {
@@ -967,9 +991,24 @@ func checkPortHTTPWithTimeout(port int, timeout time.Duration) int {
 
 			// 设置User-Agent避免被某些服务器拒绝
 			req.Header.Set("User-Agent", "node_exporter/1.0")
+			// 设置Accept头，明确请求HTTP响应
+			req.Header.Set("Accept", "*/*")
+			req.Header.Set("Connection", "close")
 
 			resp, err := client.Do(req)
-			if err == nil && resp != nil {
+			if err != nil {
+				// 检查错误类型，如果是协议错误（如收到非HTTP响应），直接返回
+				if strings.Contains(err.Error(), "malformed HTTP") ||
+				   strings.Contains(err.Error(), "unsolicited response") ||
+				   strings.Contains(err.Error(), "unexpected EOF") ||
+				   strings.Contains(err.Error(), "protocol error") {
+					// 记录协议错误，但不产生日志噪音
+					return
+				}
+				return
+			}
+
+			if resp != nil {
 				// 修复：确保响应体被正确关闭
 				defer resp.Body.Close()
 
@@ -981,19 +1020,43 @@ func checkPortHTTPWithTimeout(port int, timeout time.Duration) int {
 					contentType := resp.Header.Get("Content-Type")
 					contentLength := resp.Header.Get("Content-Length")
 					date := resp.Header.Get("Date")
+					connection := resp.Header.Get("Connection")
 
 					// 3. 更严格的HTTP服务判断：必须有HTTP响应头特征
-					if server != "" || contentType != "" || contentLength != "" || date != "" {
-						// 4. 额外检查：避免误判邮件服务器等非HTTP服务
-						// 如果Server头包含邮件相关关键词，则跳过
-						if server != "" {
-							serverLower := strings.ToLower(server)
-							if strings.Contains(serverLower, "pop3") ||
-							   strings.Contains(serverLower, "imap") ||
-							   strings.Contains(serverLower, "smtp") ||
-							   strings.Contains(serverLower, "coremail") ||
-							   strings.Contains(serverLower, "mail") {
-								return // 跳过邮件服务器
+					if server != "" || contentType != "" || contentLength != "" || date != "" || connection != "" {
+						// 4. 智能协议检测：避免误判非HTTP服务
+						if enableSmartProtocolDetection {
+							// 检查Server头中的非HTTP协议标识
+							if server != "" {
+								serverLower := strings.ToLower(server)
+								if strings.Contains(serverLower, "pop3") ||
+								   strings.Contains(serverLower, "imap") ||
+								   strings.Contains(serverLower, "smtp") ||
+								   strings.Contains(serverLower, "coremail") ||
+								   strings.Contains(serverLower, "mail") ||
+								   strings.Contains(serverLower, "ftp") ||
+								   strings.Contains(serverLower, "ssh") ||
+								   strings.Contains(serverLower, "telnet") ||
+								   strings.Contains(serverLower, "mysql") ||
+								   strings.Contains(serverLower, "postgresql") ||
+								   strings.Contains(serverLower, "redis") ||
+								   strings.Contains(serverLower, "mongodb") {
+									return // 跳过非HTTP服务
+								}
+							}
+
+							// 检查Content-Type是否为有效的HTTP类型
+							if contentType != "" {
+								contentTypeLower := strings.ToLower(contentType)
+								// 如果Content-Type包含非HTTP协议标识，跳过
+								if strings.Contains(contentTypeLower, "application/octet-stream") &&
+								   !strings.Contains(contentTypeLower, "text/") &&
+								   !strings.Contains(contentTypeLower, "application/json") &&
+								   !strings.Contains(contentTypeLower, "application/xml") &&
+								   !strings.Contains(contentTypeLower, "application/javascript") &&
+								   !strings.Contains(contentTypeLower, "image/") {
+									return // 跳过二进制协议
+								}
 							}
 						}
 
