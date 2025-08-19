@@ -136,7 +136,7 @@ func startTCPDetectionWorker() {
 						defer wg.Done()
 						defer func() {
 							if r := recover(); r != nil {
-								log.Printf("[simple_port_process_collector] TCP检测panic恢复: port=%d, error=%v", p, r)
+								log.Printf("[port_process_collector] TCP检测panic恢复: port=%d, error=%v", p, r)
 							}
 						}()
 
