@@ -175,7 +175,7 @@ func startHTTPDetectionWorker() {
 				httpDetectionQueue.ports = make(map[int]bool)
 				httpDetectionQueue.Unlock()
 
-								// 异步检测所有排队的端口，使用信号量控制并发数
+				// 异步检测所有排队的端口，使用信号量控制并发数
 				sem := make(chan struct{}, httpDetectionConcurrency) // 使用配置的并发数
 				var wg sync.WaitGroup
 				for _, port := range ports {
@@ -190,21 +190,28 @@ func startHTTPDetectionWorker() {
 							}
 						}()
 
-						// 修复：正确的信号量使用
-						sem <- struct{}{}
-						defer func() { <-sem }()
+						// 修复：正确的信号量使用，添加超时保护
+						select {
+						case sem <- struct{}{}:
+							defer func() { <-sem }()
+						case <-time.After(5 * time.Second):
+							log.Printf("[port_process_collector] HTTP检测信号量获取超时: port=%d", port)
+							return
+						}
 
 						status := checkPortHTTP(port)
 
+						// 修复：使用原子操作更新缓存，避免长时间持有锁
 						httpStatusCache.RWMutex.Lock()
 						httpStatusCache.Status[port] = status
 						httpStatusCache.LastCheck[port] = time.Now()
+						httpStatusCache.RWMutex.Unlock()
+
 						if status == 1 {
 							httpAliveHistory.Lock()
 							httpAliveHistory.Ports[port] = true
 							httpAliveHistory.Unlock()
 						}
-						httpStatusCache.RWMutex.Unlock()
 
 					}()
 				}
@@ -248,8 +255,14 @@ func startTCPDetectionWorker() {
 							}
 						}()
 
-						sem <- struct{}{}
-						defer func() { <-sem }()
+						// 修复：正确的信号量使用，添加超时保护
+						select {
+						case sem <- struct{}{}:
+							defer func() { <-sem }()
+						case <-time.After(5 * time.Second):
+							log.Printf("[port_process_collector] TCP检测信号量获取超时: port=%d", port)
+							return
+						}
 
 						// 快速模式下使用更短的超时时间
 						var alive int
@@ -260,6 +273,7 @@ func startTCPDetectionWorker() {
 							alive, respTime = checkPortTCP(port)
 						}
 
+						// 修复：使用原子操作更新缓存，避免长时间持有锁
 						portStatusCache.RWMutex.Lock()
 						portStatusCache.Status[port] = alive
 						portStatusCache.RespTime[port] = respTime
@@ -374,8 +388,14 @@ func startUDPDetectionWorker() {
 
 
 
-// 新增：初始化所有异步检测工作器
+	// 新增：初始化所有异步检测工作器
 func init() {
+	// 强制清理所有HTTP相关缓存，避免历史数据影响
+	forceCleanHTTPCaches()
+
+	// 启动内存监控goroutine
+	go startMemoryMonitor()
+
 	startHTTPDetectionWorker()
 	startTCPDetectionWorker()
 	startProcessDetectionWorker()
@@ -459,6 +479,17 @@ var (
 			}
 		}
 		return true // 默认启用智能协议检测
+	}()
+
+	// 新增：是否启用预检测的环境变量（在HTTP连接前先检测协议类型）
+	enablePreDetection = func() bool {
+		if v := os.Getenv("ENABLE_PRE_DETECTION"); v != "" {
+			enabled, err := strconv.ParseBool(v)
+			if err == nil {
+				return enabled
+			}
+		}
+		return true // 默认启用预检测
 	}()
 	// 新增：HTTP检测并发数配置
 	httpDetectionConcurrency = func() int {
@@ -976,6 +1007,44 @@ func checkPortHTTPWithTimeout(port int, timeout time.Duration) int {
 			default:
 			}
 
+			// 先进行快速协议检测，避免对非HTTP服务进行HTTP连接
+			if enablePreDetection {
+				// 快速TCP连接检测，读取前几个字节判断协议类型
+				conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, strconv.Itoa(port)), 1*time.Second)
+				if err == nil {
+					defer conn.Close()
+
+					// 设置读取超时
+					conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+
+					// 读取前几个字节
+					buffer := make([]byte, 64)
+					n, err := conn.Read(buffer)
+					if err == nil && n > 0 {
+						response := strings.ToLower(string(buffer[:n]))
+
+						// 检查是否为邮件服务器响应
+						if strings.Contains(response, "+ok") ||
+						   strings.Contains(response, "* ok") ||
+						   strings.Contains(response, "coremail") ||
+						   strings.Contains(response, "pop3") ||
+						   strings.Contains(response, "imap") ||
+						   strings.Contains(response, "smtp") {
+							return // 跳过邮件服务器
+						}
+
+						// 检查是否为其他非HTTP协议
+						if strings.Contains(response, "ssh") ||
+						   strings.Contains(response, "ftp") ||
+						   strings.Contains(response, "mysql") ||
+						   strings.Contains(response, "postgresql") ||
+						   strings.Contains(response, "redis") {
+							return // 跳过其他非HTTP服务
+						}
+					}
+				}
+			}
+
 			// 构建URL
 			url := "http://[" + ip + "]:" + strconv.Itoa(port)
 			if strings.Count(ip, ":") == 0 {
@@ -1233,13 +1302,13 @@ func getPortHTTPStatus(port int) int {
 		httpDetectionQueue.Unlock()
 
 		// 使用历史状态作为临时值，避免阻塞
+		// 修复：使用原子操作避免死锁风险
 		httpAliveHistory.RLock()
 		everAlive := httpAliveHistory.Ports[port]
 		httpAliveHistory.RUnlock()
 
 		if everAlive {
 			// 曾经HTTP成功过，使用历史状态
-			// 修复：避免重复获取锁，直接使用历史状态
 			return 1 // 有历史记录但无缓存，假设为存活
 		}
 		// 无历史记录，不暴露HTTP指标，等待异步检测完成
@@ -1487,6 +1556,90 @@ func cleanStalePortCaches(infos []PortProcessInfo) {
 		}
 	}
 	processAliveCache.RWMutex.Unlock()
+}
+
+// 内存监控goroutine，定期清理内存泄漏
+func startMemoryMonitor() {
+	ticker := time.NewTicker(10 * time.Minute) // 每10分钟检查一次
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// 检查并清理过大的缓存
+			cleanupLargeCaches()
+		}
+	}
+}
+
+// 清理过大的缓存，防止内存泄漏
+func cleanupLargeCaches() {
+	// 清理HTTP状态缓存
+	httpStatusCache.RWMutex.Lock()
+	if len(httpStatusCache.Status) > 5000 {
+		httpStatusCache.Status = make(map[int]int)
+		httpStatusCache.LastCheck = make(map[int]time.Time)
+		log.Printf("[port_process_collector] 清理HTTP状态缓存，防止内存泄漏")
+	}
+	httpStatusCache.RWMutex.Unlock()
+
+	// 清理HTTP历史记录
+	httpAliveHistory.Lock()
+	if len(httpAliveHistory.Ports) > 5000 {
+		httpAliveHistory.Ports = make(map[int]bool)
+		log.Printf("[port_process_collector] 清理HTTP历史记录，防止内存泄漏")
+	}
+	httpAliveHistory.Unlock()
+
+	// 清理端口状态缓存
+	portStatusCache.RWMutex.Lock()
+	if len(portStatusCache.Status) > 5000 {
+		portStatusCache.Status = make(map[int]int)
+		portStatusCache.RespTime = make(map[int]float64)
+		portStatusCache.LastCheck = make(map[int]time.Time)
+		log.Printf("[port_process_collector] 清理端口状态缓存，防止内存泄漏")
+	}
+	portStatusCache.RWMutex.Unlock()
+
+	// 清理UDP状态缓存
+	udpStatusCache.RWMutex.Lock()
+	if len(udpStatusCache.Status) > 5000 {
+		udpStatusCache.Status = make(map[int]int)
+		udpStatusCache.LastCheck = make(map[int]time.Time)
+		log.Printf("[port_process_collector] 清理UDP状态缓存，防止内存泄漏")
+	}
+	udpStatusCache.RWMutex.Unlock()
+
+	// 清理进程存活缓存
+	processAliveCache.RWMutex.Lock()
+	if len(processAliveCache.Status) > 5000 {
+		processAliveCache.Status = make(map[string]int)
+		processAliveCache.LastCheck = make(map[string]time.Time)
+		log.Printf("[port_process_collector] 清理进程存活缓存，防止内存泄漏")
+	}
+	processAliveCache.RWMutex.Unlock()
+}
+
+// 强制清理所有HTTP相关缓存，避免历史数据影响
+func forceCleanHTTPCaches() {
+	// 按照固定顺序获取锁，避免死锁
+	// 顺序：httpDetectionQueue -> httpAliveHistory -> httpStatusCache
+
+	// 清理HTTP检测队列
+	httpDetectionQueue.Lock()
+	httpDetectionQueue.ports = make(map[int]bool)
+	httpDetectionQueue.Unlock()
+
+	// 清理HTTP历史记录
+	httpAliveHistory.Lock()
+	httpAliveHistory.Ports = make(map[int]bool)
+	httpAliveHistory.Unlock()
+
+	// 清理HTTP状态缓存
+	httpStatusCache.RWMutex.Lock()
+	httpStatusCache.Status = make(map[int]int)
+	httpStatusCache.LastCheck = make(map[int]time.Time)
+	httpStatusCache.RWMutex.Unlock()
 }
 
 // 带缓存的进程存活检测（完全异步化，避免阻塞指标暴露）
