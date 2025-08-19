@@ -958,20 +958,45 @@ func checkPortHTTPWithTimeout(port int, timeout time.Duration) int {
 				url = "http://" + ip + ":" + strconv.Itoa(port)
 			}
 
-			// 创建HTTP客户端
+			// 创建HTTP客户端，使用HEAD请求避免下载大量数据
 			client := &http.Client{Timeout: timeout}
-			resp, err := client.Get(url)
+			req, err := http.NewRequest("HEAD", url, nil)
+			if err != nil {
+				return
+			}
+
+			// 设置User-Agent避免被某些服务器拒绝
+			req.Header.Set("User-Agent", "node_exporter/1.0")
+
+			resp, err := client.Do(req)
 			if err == nil && resp != nil {
 				// 修复：确保响应体被正确关闭
 				defer resp.Body.Close()
-				// 更严格的HTTP检测：检查状态码和Content-Type
+
+				// 检查是否为有效的HTTP响应
+				// 1. 状态码在有效范围内
 				if resp.StatusCode >= 200 && resp.StatusCode < 600 {
+					// 2. 检查是否有HTTP响应头特征
+					server := resp.Header.Get("Server")
 					contentType := resp.Header.Get("Content-Type")
-					// 检查是否为有效的HTTP响应
-					if contentType != "" || resp.Header.Get("Server") != "" ||
-						strings.HasPrefix(contentType, "text/") ||
-						strings.HasPrefix(contentType, "application/") ||
-						strings.HasPrefix(contentType, "image/") {
+					contentLength := resp.Header.Get("Content-Length")
+					date := resp.Header.Get("Date")
+
+					// 3. 更严格的HTTP服务判断：必须有HTTP响应头特征
+					if server != "" || contentType != "" || contentLength != "" || date != "" {
+						// 4. 额外检查：避免误判邮件服务器等非HTTP服务
+						// 如果Server头包含邮件相关关键词，则跳过
+						if server != "" {
+							serverLower := strings.ToLower(server)
+							if strings.Contains(serverLower, "pop3") ||
+							   strings.Contains(serverLower, "imap") ||
+							   strings.Contains(serverLower, "smtp") ||
+							   strings.Contains(serverLower, "coremail") ||
+							   strings.Contains(serverLower, "mail") {
+								return // 跳过邮件服务器
+							}
+						}
+
 						select {
 						case resultCh <- struct{}{}:
 							cancel() // 有一个成功就取消其他
