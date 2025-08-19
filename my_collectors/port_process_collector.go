@@ -175,6 +175,11 @@ func startHTTPDetectionWorker() {
 				httpDetectionQueue.ports = make(map[int]bool)
 				httpDetectionQueue.Unlock()
 
+				// 限制单次处理的端口数量，避免过度积压
+				if len(ports) > 100 {
+					ports = ports[:100]
+				}
+
 				// 异步检测所有排队的端口，使用信号量控制并发数
 				sem := make(chan struct{}, httpDetectionConcurrency) // 使用配置的并发数
 				var wg sync.WaitGroup
@@ -194,8 +199,8 @@ func startHTTPDetectionWorker() {
 						select {
 						case sem <- struct{}{}:
 							defer func() { <-sem }()
-						case <-time.After(5 * time.Second):
-							log.Printf("[port_process_collector] HTTP检测信号量获取超时: port=%d", port)
+						case <-time.After(2 * time.Second):
+							// 减少超时时间，避免长时间阻塞
 							return
 						}
 
@@ -240,6 +245,11 @@ func startTCPDetectionWorker() {
 				tcpDetectionQueue.ports = make(map[int]bool)
 				tcpDetectionQueue.Unlock()
 
+				// 限制单次处理的端口数量，避免过度积压
+				if len(ports) > 100 {
+					ports = ports[:100]
+				}
+
 				// 异步检测所有排队的端口
 				sem := make(chan struct{}, maxParallelIPChecks)
 				var wg sync.WaitGroup
@@ -259,8 +269,8 @@ func startTCPDetectionWorker() {
 						select {
 						case sem <- struct{}{}:
 							defer func() { <-sem }()
-						case <-time.After(5 * time.Second):
-							log.Printf("[port_process_collector] TCP检测信号量获取超时: port=%d", port)
+						case <-time.After(2 * time.Second):
+							// 减少超时时间，避免长时间阻塞
 							return
 						}
 
@@ -457,7 +467,7 @@ var (
 				return n
 			}
 		}
-		return 8
+		return 20 // 增加到20个并发，减少超时
 	}()
 	// 新增：是否启用HTTP检测的环境变量
 	enableHTTPDetection = func() bool {
@@ -499,7 +509,7 @@ var (
 				return n
 			}
 		}
-		return 10 // 默认10个并发
+		return 50 // 增加到50个并发，减少超时
 	}()
 	// 新增：HTTP检测工作器处理间隔配置
 	httpDetectionInterval = func() time.Duration {
@@ -509,7 +519,7 @@ var (
 				return d
 			}
 		}
-		return 30 * time.Second // 完全异步检测下，30秒处理一次即可
+		return 10 * time.Second // 减少到10秒，提高处理频率
 	}()
 
 	// 新增：HTTP检测超时时间配置（更短的超时时间，避免长时间阻塞）
@@ -1277,7 +1287,10 @@ func getPortStatus(port int) (alive int, respTime float64) {
 
 		// 缓存过期，加入TCP异步检测队列
 		tcpDetectionQueue.Lock()
-		tcpDetectionQueue.ports[port] = true
+		// 限制队列大小，避免内存泄漏
+		if len(tcpDetectionQueue.ports) < 500 {
+			tcpDetectionQueue.ports[port] = true
+		}
 		tcpDetectionQueue.Unlock()
 
 		// 修复：避免重复获取锁，直接返回-1等待异步检测完成
@@ -1296,10 +1309,13 @@ func getPortHTTPStatus(port int) int {
 	t, ok := httpStatusCache.LastCheck[port]
 	if !ok || now.Sub(t) > httpStatusInterval {
 		httpStatusCache.RWMutex.RUnlock()
-		// 缓存过期，加入异步检测队列
-		httpDetectionQueue.Lock()
+			// 缓存过期，加入异步检测队列
+	httpDetectionQueue.Lock()
+	// 限制队列大小，避免内存泄漏
+	if len(httpDetectionQueue.ports) < 500 {
 		httpDetectionQueue.ports[port] = true
-		httpDetectionQueue.Unlock()
+	}
+	httpDetectionQueue.Unlock()
 
 		// 使用历史状态作为临时值，避免阻塞
 		// 修复：使用原子操作避免死锁风险
