@@ -110,7 +110,7 @@ jobs:
             OS=linux
           tags: |
             ${{ github.repository_owner }}/node_exporter:latest
-            ghcr.io/${{ github.repository_owner }}/node_exporter:latest 
+            ghcr.io/${{ github.repository_owner }}/node_exporter:latest
 
       - name: 重命名产物以避免同名
         run: |
@@ -136,9 +136,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 清理旧的 workflow artifacts
-        uses: c-hive/gha-remove-artifacts@v1
+      - name: 删除 workflow runs
+        uses: Mattraks/delete-workflow-runs@main
         with:
-          age: '1min'
-          skip-recent: 1
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 
+          token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          retain_days: 0
+          keep_minimum_runs: 4
