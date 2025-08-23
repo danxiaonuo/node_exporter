@@ -65,7 +65,11 @@ jobs:
     # 第四步：如果版本不同则更新
     - name: 更新到最新版本
       run: |
-        if [ "$CURRENT_VERSION" != "$LATEST_VERSION" ] && [ "$CURRENT_VERSION" != "unknown" ]; then
+        # 标准化版本格式，移除可能的 'v' 前缀进行比较
+        CURRENT_VERSION_CLEAN=$(echo "$CURRENT_VERSION" | sed 's/^v//')
+        LATEST_VERSION_CLEAN=$(echo "$LATEST_VERSION" | sed 's/^v//')
+
+        if [ "$CURRENT_VERSION_CLEAN" != "$LATEST_VERSION_CLEAN" ] && [ "$CURRENT_VERSION" != "unknown" ]; then
           echo "Updating from $CURRENT_VERSION to $LATEST_VERSION"
           cd node_exporter
           git checkout $LATEST_VERSION
@@ -88,7 +92,7 @@ jobs:
           git commit -m "Auto update node_exporter to $LATEST_VERSION (unknown previous version)"
           git push
         else
-          echo "Already at latest version $LATEST_VERSION"
+          echo "Already at latest version $LATEST_VERSION (cleaned: $CURRENT_VERSION_CLEAN = $LATEST_VERSION_CLEAN)"
         fi
 
     # 第五步：删除旧的workflow runs
