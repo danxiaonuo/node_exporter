@@ -52,23 +52,15 @@ jobs:
         run: |
           bash my_collectors/auto_register_collectors.sh
 
-      - name: 设置版本信息环境变量
-        working-directory: node_exporter
-        run: |
-          echo "VERSION=$(git describe --tags --always || echo dev)" >> $GITHUB_ENV
-          echo "REVISION=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
-          echo "BRANCH=$(git rev-parse --abbrev-ref HEAD)" >> $GITHUB_ENV
-          echo "BUILDUSER=$(whoami)@$(hostname)" >> $GITHUB_ENV
-          echo "BUILDDATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_ENV
-
-      # 多平台二进制文件编译
+      # 多平台二进制文件编译（使用 promu crossbuild）
       - name: 构建多平台二进制文件（静态编译）
+        working-directory: node_exporter
+        env:
+          CGO_ENABLED: 0
         run: |
-          cd node_exporter
           go mod tidy
-          mkdir -p .build/linux-amd64 .build/linux-arm64
-          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64  go build -ldflags "-X github.com/prometheus/common/version.Version=${VERSION} -X github.com/prometheus/common/version.Revision=${REVISION} -X github.com/prometheus/common/version.Branch=${BRANCH} -X github.com/prometheus/common/version.BuildUser=${BUILDUSER} -X github.com/prometheus/common/version.BuildDate=${BUILDDATE}" -o .build/linux-amd64/node_exporter
-          CGO_ENABLED=0 GOOS=linux   GOARCH=arm64  go build -ldflags "-X github.com/prometheus/common/version.Version=${VERSION} -X github.com/prometheus/common/version.Revision=${REVISION} -X github.com/prometheus/common/version.Branch=${BRANCH} -X github.com/prometheus/common/version.BuildUser=${BUILDUSER} -X github.com/prometheus/common/version.BuildDate=${BUILDDATE}" -o .build/linux-arm64/node_exporter
+          # 使用 promu crossbuild 构建多平台二进制文件
+          promu crossbuild -v
 
       # 上传所有平台的二进制文件到 GitHub Actions 构建产物区
       - name: 上传多平台二进制文件
@@ -78,6 +70,7 @@ jobs:
           path: |
             node_exporter/.build/linux-amd64/node_exporter
             node_exporter/.build/linux-arm64/node_exporter
+            node_exporter/.build/openbsd-amd64/node_exporter
 
       - name: 设置 QEMU（支持多平台 Docker 构建）
         uses: docker/setup-qemu-action@v3
@@ -114,8 +107,16 @@ jobs:
 
       - name: 重命名产物以避免同名
         run: |
-          mv node_exporter/.build/linux-amd64/node_exporter node_exporter/.build/linux-amd64/node_exporter-linux-amd64
-          mv node_exporter/.build/linux-arm64/node_exporter node_exporter/.build/linux-arm64/node_exporter-linux-arm64
+          # 重命名 Linux 平台的二进制文件
+          if [ -f "node_exporter/.build/linux-amd64/node_exporter" ]; then
+            mv node_exporter/.build/linux-amd64/node_exporter node_exporter/.build/linux-amd64/node_exporter-linux-amd64
+          fi
+          if [ -f "node_exporter/.build/linux-arm64/node_exporter" ]; then
+            mv node_exporter/.build/linux-arm64/node_exporter node_exporter/.build/linux-arm64/node_exporter-linux-arm64
+          fi
+          if [ -f "node_exporter/.build/openbsd-amd64/node_exporter" ]; then
+            mv node_exporter/.build/openbsd-amd64/node_exporter node_exporter/.build/openbsd-amd64/node_exporter-openbsd-amd64
+          fi
 
       - name: 发布到 GitHub Releases
         uses: softprops/action-gh-release@v2
@@ -125,6 +126,7 @@ jobs:
           files: |
             node_exporter/.build/linux-amd64/node_exporter-linux-amd64
             node_exporter/.build/linux-arm64/node_exporter-linux-arm64
+            node_exporter/.build/openbsd-amd64/node_exporter-openbsd-amd64
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
