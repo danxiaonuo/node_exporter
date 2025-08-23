@@ -52,6 +52,25 @@ jobs:
         run: |
           bash my_collectors/auto_register_collectors.sh
 
+      # 安装 promu 构建工具
+      - name: 安装 promu
+        working-directory: node_exporter
+        run: |
+          # 获取最新版本的 promu
+          PROMU_VERSION=$(curl -s https://api.github.com/repos/prometheus/promu/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' | sed 's/v//')
+          GO_BUILD_PLATFORM=linux-amd64
+          PROMU_URL="https://github.com/prometheus/promu/releases/download/v${PROMU_VERSION}/promu-${PROMU_VERSION}.${GO_BUILD_PLATFORM}.tar.gz"
+
+          echo "Installing promu version: ${PROMU_VERSION}"
+          mkdir -p ~/go/bin
+          curl -fsS -L ${PROMU_URL} | tar -xvzf - -C /tmp
+          cp /tmp/promu-${PROMU_VERSION}.${GO_BUILD_PLATFORM}/promu ~/go/bin/
+          chmod +x ~/go/bin/promu
+          echo "$HOME/go/bin" >> $GITHUB_PATH
+
+          # 验证安装
+          promu --version
+
       # 多平台二进制文件编译（使用 promu crossbuild）
       - name: 构建多平台二进制文件（静态编译）
         working-directory: node_exporter
