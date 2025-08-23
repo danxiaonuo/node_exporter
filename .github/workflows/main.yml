@@ -69,7 +69,7 @@ jobs:
           echo "$HOME/go/bin" >> $GITHUB_PATH
 
           # 验证安装
-          promu --version
+          promu --help
 
       # 多平台二进制文件编译（使用 promu crossbuild）
       - name: 构建多平台二进制文件（静态编译）
