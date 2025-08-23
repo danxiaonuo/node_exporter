@@ -43,7 +43,7 @@ jobs:
       run: |
         cd node_exporter
         git fetch --tags
-        LATEST_VERSION=$(git describe --tags --abbrev=0)
+        LATEST_VERSION=$(git tag --sort=-version:refname | grep '^v[0-9]' | head -1)
         echo "Latest version: $LATEST_VERSION"
         echo "LATEST_VERSION=$LATEST_VERSION" >> $GITHUB_ENV
 
