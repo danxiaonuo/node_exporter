@@ -38,21 +38,42 @@ jobs:
         token: ${{ secrets.CI_TOKEN }}
         submodules: true
 
-    # 第二步：同步主仓库和子模块到最新
-    - name: 同步子模块到最新
+    # 第二步：获取最新版本信息
+    - name: 获取最新版本
       run: |
-        git pull --recurse-submodules
-        git submodule update --remote --recursive
+        cd node_exporter
+        git fetch --tags
+        LATEST_VERSION=$(git describe --tags --abbrev=0)
+        echo "Latest version: $LATEST_VERSION"
+        echo "LATEST_VERSION=$LATEST_VERSION" >> $GITHUB_ENV
 
-    # 第三步：自动提交并推送同步结果
-    - name: 自动提交并推送
+    # 第三步：检查当前版本
+    - name: 检查当前版本
       run: |
-        git config --global user.name 'Git bot'
-        git config --global user.email 'bot@noreply.github.com'
-        git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
-        git commit -am "Auto updated submodule references" && git push || echo "无变更，无需提交"
+        cd node_exporter
+        CURRENT_VERSION=$(cat VERSION)
+        echo "Current version: $CURRENT_VERSION"
+        echo "CURRENT_VERSION=$CURRENT_VERSION" >> $GITHUB_ENV
 
-    # 第四步：删除旧的workflow runs
+    # 第四步：如果版本不同则更新
+    - name: 更新到最新版本
+      run: |
+        if [ "$CURRENT_VERSION" != "$LATEST_VERSION" ]; then
+          echo "Updating from $CURRENT_VERSION to $LATEST_VERSION"
+          cd node_exporter
+          git checkout $LATEST_VERSION
+          cd ..
+          git add node_exporter
+          git config --global user.name 'Git bot'
+          git config --global user.email 'bot@noreply.github.com'
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
+          git commit -m "Auto update node_exporter from $CURRENT_VERSION to $LATEST_VERSION"
+          git push
+        else
+          echo "Already at latest version $LATEST_VERSION"
+        fi
+
+    # 第五步：删除旧的workflow runs
     - name: 删除 workflow runs
       uses: Mattraks/delete-workflow-runs@main
       with:
