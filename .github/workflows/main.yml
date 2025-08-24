@@ -55,15 +55,28 @@ jobs:
       - name: 设置版本信息环境变量
         working-directory: node_exporter
         run: |
-          # 优先使用 VERSION 文件中的版本号
+          # 从远程仓库获取所有的 tag 到本地
+          git fetch --tags
+          # 按照 Makefile 的逻辑获取版本号
+          # 1. 优先使用 VERSION 文件中的版本号
           if [ -f "VERSION" ]; then
             VERSION=$(cat VERSION | tr -d '\n\r')
+            echo "从 VERSION 文件获取版本号: $VERSION"
+
+          # 2. 使用 Git 标签作为版本号
+          elif git describe --tags --abbrev=0 2>/dev/null; then
+            VERSION=$(git describe --tags --abbrev=0)
+            echo "从 Git 标签获取版本号: $VERSION"
+
+          # 3. 如果有精确的标签匹配，使用精确标签
           elif git describe --tags --exact-match 2>/dev/null; then
-            # 如果有精确的标签匹配，使用标签名
             VERSION=$(git describe --tags --exact-match)
+            echo "从精确 Git 标签获取版本号: $VERSION"
+
+          # 4. 如果以上都没有，使用commit hash作为开发版本
           else
-            # 否则使用最近的标签加上距离和commit hash
-            VERSION=$(git describe --tags --always)
+            VERSION="dev-$(git rev-parse --short HEAD)"
+            echo "使用commit hash作为开发版本号: $VERSION"
           fi
 
           # 获取完整的commit hash作为revision
@@ -79,8 +92,16 @@ jobs:
           echo "REVISION=$REVISION" >> $GITHUB_ENV
           echo "BRANCH=$BRANCH" >> $GITHUB_ENV
           # echo "BUILDUSER=$(whoami)@$(hostname)" >> $GITHUB_ENV
-          echo "BUILDUSER=xiaonuo" >> $GITHUB_ENV
+          echo "BUILDUSER=xiaonuo (Author: xiaonuo)" >> $GITHUB_ENV
           echo "BUILDDATE=$(TZ='Asia/Shanghai' date +'%Y-%m-%dT%H:%M:%S+08:00')" >> $GITHUB_ENV
+
+      - name: 调试版本信息
+        run: |
+          echo "VERSION: $VERSION"
+          echo "BRANCH: $BRANCH"
+          echo "REVISION: $REVISION"
+          echo "BUILDUSER: $BUILDUSER"
+          echo "BUILDDATE: $BUILDDATE"      
 
       # 多平台二进制文件编译
       - name: 构建多平台二进制文件（静态编译）
@@ -88,8 +109,9 @@ jobs:
           cd node_exporter
           go mod tidy
           mkdir -p .build/linux-amd64 .build/linux-arm64
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-X github.com/prometheus/common/version.Version=${VERSION} -X github.com/prometheus/common/version.Revision=${REVISION} -X github.com/prometheus/common/version.Branch=${BRANCH} -X github.com/prometheus/common/version.BuildUser=${BUILDUSER} -X github.com/prometheus/common/version.BuildDate=${BUILDDATE}" -o .build/linux-amd64/node_exporter
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags "-X github.com/prometheus/common/version.Version=${VERSION} -X github.com/prometheus/common/version.Revision=${REVISION} -X github.com/prometheus/common/version.Branch=${BRANCH} -X github.com/prometheus/common/version.BuildUser=${BUILDUSER} -X github.com/prometheus/common/version.BuildDate=${BUILDDATE}" -o .build/linux-arm64/node_exporter
+          LDFLAGS="-X 'github.com/prometheus/common/version.Version=${VERSION}' -X 'github.com/prometheus/common/version.Branch=${BRANCH}' -X 'github.com/prometheus/common/version.Revision=${REVISION}' -X 'github.com/prometheus/common/version.BuildUser=${BUILDUSER}' -X 'github.com/prometheus/common/version.BuildDate=${BUILDDATE}'"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="$LDFLAGS" -o .build/linux-amd64/node_exporter
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="$LDFLAGS" -o .build/linux-arm64/node_exporter
 
       # 上传所有平台的二进制文件到 GitHub Actions 构建产物区
       - name: 上传多平台二进制文件
@@ -164,3 +186,4 @@ jobs:
           repository: ${{ github.repository }}
           retain_days: 0
           keep_minimum_runs: 1
+
