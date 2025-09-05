@@ -1,9 +1,13 @@
 package my_collectors
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"os"
+	"os/exec"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -201,18 +205,80 @@ func collectHardwareInfo() *HardwareInfo {
 	}
 	// 磁盘信息，增加超时保护
 	type diskResult struct {
-		du  *disk.UsageStat
-		err error
+		totalBytes float64
+		err        error
 	}
 	diskCh := make(chan diskResult, 1)
 	go func() {
-		du, err := disk.Usage("/")
-		diskCh <- diskResult{du: du, err: err}
+		var total float64
+		// 方法一：lsblk（TYPE=disk）
+		ctx1, cancel1 := context.WithTimeout(context.Background(), hardwareInfoTimeout)
+		defer cancel1()
+		cmd := exec.CommandContext(ctx1, "lsblk", "-b", "-dn", "-o", "NAME,SIZE,TYPE")
+		if out, e := cmd.Output(); e == nil {
+			lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+			for _, line := range lines {
+				fields := strings.Fields(line)
+				if len(fields) >= 3 && fields[2] == "disk" {
+					if sz, perr := strconv.ParseUint(fields[1], 10, 64); perr == nil {
+						total += float64(sz)
+					}
+				}
+			}
+		}
+		// 方法二：按分区汇总本地固定磁盘（跳过远程/光驱/可移动），带超时
+		if total == 0 {
+			ctx, cancel := context.WithTimeout(context.Background(), hardwareInfoTimeout)
+			defer cancel()
+			if parts, perr := disk.PartitionsWithContext(ctx, false); perr == nil {
+				for _, part := range parts {
+					if ctx.Err() != nil {
+						break
+					}
+					opts := strings.ToLower(part.Opts)
+					if strings.Contains(opts, "remote") || strings.Contains(opts, "cdrom") || strings.Contains(opts, "removable") {
+						continue
+					}
+					if du, derr := disk.UsageWithContext(ctx, part.Mountpoint); derr == nil && du != nil {
+						total += float64(du.Total)
+					}
+				}
+			}
+		}
+		// 方法三：ghw 汇总物理磁盘（若前两者无结果）
+		if total == 0 {
+			if blk, gerr := ghw.Block(); gerr == nil && blk != nil {
+				for _, d := range blk.Disks {
+					name := d.Name
+					if name == "" {
+						continue
+					}
+					if strings.HasPrefix(name, "loop") ||
+						strings.HasPrefix(name, "ram") ||
+						strings.HasPrefix(name, "zram") ||
+						strings.HasPrefix(name, "dm-") ||
+						strings.HasPrefix(name, "sr") ||
+						strings.HasPrefix(name, "md") {
+						continue
+					}
+					if d.SizeBytes > 0 {
+						total += float64(d.SizeBytes)
+					}
+				}
+			}
+		}
+		// 方法四：根分区兜底，避免返回 0
+		if total == 0 {
+			if du, derr := disk.Usage("/"); derr == nil && du != nil {
+				total = float64(du.Total)
+			}
+		}
+		diskCh <- diskResult{totalBytes: total, err: nil}
 	}()
 	select {
 	case res := <-diskCh:
-		if res.err == nil && res.du != nil {
-			info.DiskTotal = float64(res.du.Total)
+		if res.totalBytes > 0 {
+			info.DiskTotal = res.totalBytes
 		}
 	case <-time.After(hardwareInfoTimeout):
 		// 超时则保留默认值
