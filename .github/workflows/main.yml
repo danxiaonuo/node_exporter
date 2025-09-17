@@ -153,7 +153,9 @@ jobs:
             OS=linux
           tags: |
             ${{ github.repository_owner }}/node_exporter:latest
+            ${{ github.repository_owner }}/node_exporter:${VERSION}
             ghcr.io/${{ github.repository_owner }}/node_exporter:latest
+            ghcr.io/${{ github.repository_owner }}/node_exporter:${VERSION}
 
       - name: 重命名产物以避免同名
         run: |
@@ -186,4 +188,5 @@ jobs:
           repository: ${{ github.repository }}
           retain_days: 0
           keep_minimum_runs: 1
+
 
