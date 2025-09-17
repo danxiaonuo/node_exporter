@@ -152,10 +152,10 @@ jobs:
             ARCH=amd64
             OS=linux
           tags: |
-            ${{ github.repository_owner }}/node_exporter:latest
-            ${{ github.repository_owner }}/node_exporter:${{ env.VERSION }}
-            ghcr.io/${{ github.repository_owner }}/node_exporter:latest
-            ghcr.io/${{ github.repository_owner }}/node_exporter:${{ env.VERSION }}
+            ${{ github.repository_owner }}/node-exporter:latest
+            ${{ github.repository_owner }}/node-exporter:${{ env.VERSION }}
+            ghcr.io/${{ github.repository_owner }}/node-exporter:latest
+            ghcr.io/${{ github.repository_owner }}/node-exporter:${{ env.VERSION }}
 
       - name: 重命名产物以避免同名
         run: |
@@ -188,6 +188,7 @@ jobs:
           repository: ${{ github.repository }}
           retain_days: 0
           keep_minimum_runs: 1
+
 
 
 
