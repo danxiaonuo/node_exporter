@@ -80,10 +80,16 @@ func collectNetworkInterfaceInfo() []NetworkInterfaceInfo {
 		if err != nil {
 			continue
 		}
+		// 使用 map 来去重 IP 地址
+		ipSet := make(map[string]bool)
 		var ipAddresses []string
 		for _, addr := range addrs {
 			if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.To4() != nil {
-				ipAddresses = append(ipAddresses, ipnet.IP.String())
+				ipStr := ipnet.IP.String()
+				if !ipSet[ipStr] {
+					ipSet[ipStr] = true
+					ipAddresses = append(ipAddresses, ipStr)
+				}
 			}
 		}
 		if len(ipAddresses) > 0 {
