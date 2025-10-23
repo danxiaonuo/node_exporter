@@ -11,6 +11,7 @@ import (
 	"net"      // 提供网络相关功能，用于端口检测
 	"os"       // 提供操作系统接口，用于文件操作
 	"path/filepath" // 提供路径操作功能
+	"runtime"  // 提供运行时信息，用于内存统计
 	"sort"     // 提供排序功能，用于优化缓存清理算法
 	"strconv"  // 提供字符串与数字转换功能
 	"strings"  // 提供字符串操作功能
@@ -124,6 +125,15 @@ const (
 	// DefaultTicksPerSecond 默认每秒时钟滴答数
 	// 系统时钟频率，用于CPU使用率计算
 	DefaultTicksPerSecond = 100
+
+	// ========== 性能优化常量 ==========
+	// DefaultProcessFieldsCapacity 默认进程字段容量
+	// 用于预分配切片容量，减少内存重新分配
+	DefaultProcessFieldsCapacity = 52
+
+	// DefaultStringBuilderCapacity 默认字符串构建器容量
+	// 用于预分配字符串构建器容量，提高字符串拼接效率
+	DefaultStringBuilderCapacity = 64
 )
 
 // ========== 可配置变量区域 ==========
@@ -312,7 +322,7 @@ func startTCPDetectionWorker() {
 
 				// 获取待检测的端口列表（加锁保护）
 				tcpDetectionQueue.Lock()
-				ports := make([]int, 0, len(tcpDetectionQueue.ports))
+				ports := makeSliceWithCapacity[int](len(tcpDetectionQueue.ports))
 				for port := range tcpDetectionQueue.ports {
 					ports = append(ports, port)
 				}
@@ -331,17 +341,7 @@ func startTCPDetectionWorker() {
 						defer wg.Done() // 任务完成时减少等待计数
 
 						// panic恢复机制，确保单个端口检测失败不影响其他端口
-						defer func() {
-							if r := recover(); r != nil {
-								log.Printf("[port_process_collector] TCP检测panic恢复: port=%d, error=%v", p, r)
-								// panic恢复后设置端口状态为未知，避免使用错误数据
-								portStatusCache.RWMutex.Lock()
-								portStatusCache.Status[p] = -1
-								portStatusCache.LastCheck[p] = time.Now()
-								portStatusCache.RWMutex.Unlock()
-								return
-							}
-						}()
+						defer recoverFromPanic("TCP检测", p)
 
 						// 获取信号量，控制并发数
 						sem <- struct{}{}
@@ -379,7 +379,6 @@ func startTCPDetectionWorker() {
 				case <-time.After(30 * time.Second):
 					// 超时，记录警告但不阻塞
 					log.Printf("[port_process_collector] TCP检测超时，部分goroutine可能仍在运行")
-					// 注意：这里无法强制取消goroutine，因为context没有传递到goroutine中
 					// 等待一小段时间让goroutine有机会退出
 					select {
 					case <-done:
@@ -413,7 +412,7 @@ func startProcessDetectionWorker() {
 
 				// 获取待检测的进程ID列表（加锁保护）
 				processDetectionQueue.Lock()
-				pids := make([]int, 0, len(processDetectionQueue.pids))
+				pids := makeSliceWithCapacity[int](len(processDetectionQueue.pids))
 				for pid := range processDetectionQueue.pids {
 					pids = append(pids, pid)
 				}
@@ -429,18 +428,7 @@ func startProcessDetectionWorker() {
 						defer wg.Done() // 任务完成时减少等待计数
 
 						// panic恢复机制，确保单个进程检测失败不影响其他进程
-						defer func() {
-							if r := recover(); r != nil {
-								log.Printf("[simple_port_process_collector] 进程检测panic恢复: pid=%d, error=%v", p, r)
-								// panic恢复后设置进程状态为死亡，避免使用错误数据
-								key := getPidKey(p)
-								processAliveCache.RWMutex.Lock()
-								processAliveCache.Status[key] = 0
-								processAliveCache.LastCheck[key] = time.Now()
-								processAliveCache.RWMutex.Unlock()
-								return
-							}
-						}()
+						defer recoverFromPanic("进程检测", p)
 
 						// 检测进程是否存活
 						status := checkProcess(p)
@@ -531,6 +519,7 @@ func ShutdownWorkers() {
 		close(processDetectionQueue.done)        // 关闭进程检测队列
 		close(processStatusDetectionQueue.done)  // 关闭进程状态检测队列
 		close(processPidCacheCleanQueue.done)    // 关闭进程PID缓存清理队列
+		close(memoryCleanupQueue.done)           // 关闭内存清理队列
 	})
 }
 
@@ -788,6 +777,12 @@ var processPidCacheCleanQueue = struct {
 	done chan struct{}   // 关闭信号通道，用于优雅关闭清理工作器
 }{done: make(chan struct{})}
 
+// memoryCleanupQueue 内存清理队列
+// 用于异步清理过期的缓存数据
+var memoryCleanupQueue = struct {
+	done chan struct{}   // 关闭信号通道，用于优雅关闭清理工作器
+}{done: make(chan struct{})}
+
 // processStatusInterval 进程状态检测间隔配置
 // 支持通过环境变量 PROCESS_STATUS_INTERVAL 进行配置
 // 控制进程详细状态检测的频率
@@ -1034,6 +1029,11 @@ func getPortProcessInfo() []PortProcessInfo {
 // 该函数是端口进程发现的核心算法，使用高效的映射方式减少系统调用
 // 算法思路：先解析网络连接表建立inode到端口的映射，再遍历进程文件描述符查找socket inode
 func discoverPortProcess() []PortProcessInfo {
+	start := time.Now()
+	defer func() {
+		updatePerformanceStats("port_scan", time.Since(start))
+	}()
+
 	var results []PortProcessInfo
 
 	// 第一步：解析网络连接表，建立inode到端口的映射
@@ -1075,7 +1075,13 @@ func discoverPortProcess() []PortProcessInfo {
 		}
 
 		// 第四步：读取进程的文件描述符目录
-		fdPath := procPath(fmt.Sprintf("/proc/%d/fd", pid))
+		// 使用strings.Builder优化字符串拼接
+		var pathBuilder strings.Builder
+		pathBuilder.Grow(len("/proc/") + len(entry.Name()) + len("/fd"))
+		pathBuilder.WriteString("/proc/")
+		pathBuilder.WriteString(entry.Name())
+		pathBuilder.WriteString("/fd")
+		fdPath := procPath(pathBuilder.String())
 		fds, err := os.ReadDir(fdPath)
 		if err != nil {
 			log.Printf("[simple_port_process_collector] failed to read %s: %v\n", fdPath, err)
@@ -1084,7 +1090,14 @@ func discoverPortProcess() []PortProcessInfo {
 
 		// 第五步：遍历进程的所有文件描述符
 		for _, fdEntry := range fds {
-			fdLink := fmt.Sprintf("%s/%s", fdPath, fdEntry.Name())
+			// 使用strings.Builder优化字符串拼接
+			var builder strings.Builder
+			builder.Grow(len(fdPath) + len(fdEntry.Name()) + 1)
+			builder.WriteString(fdPath)
+			builder.WriteString("/")
+			builder.WriteString(fdEntry.Name())
+			fdLink := builder.String()
+
 			link, err := os.Readlink(fdLink)
 			if err != nil {
 				log.Printf("[simple_port_process_collector] failed to readlink %s: %v\n", fdLink, err)
@@ -1149,6 +1162,11 @@ func parseInodePortMap(files []string, proto string) map[string]int {
 
 		// 按行分割文件内容
 		lines := strings.Split(string(content), "\n")
+
+		// 检查是否有数据行
+		if len(lines) <= 1 {
+			continue // 跳过没有数据行的文件
+		}
 
 		// 跳过第一行（标题行），处理数据行
 		for _, line := range lines[1:] {
@@ -1313,18 +1331,27 @@ func getProcStatFields(pid int) ([]string, error) {
         return nil, err
     }
     s := strings.TrimSpace(string(content))
+    if s == "" {
+        return nil, fmt.Errorf("empty stat file for pid %d", pid)
+    }
+
     // 形如: pid (comm with spaces) state ...
     l := strings.IndexByte(s, '(')
     r := strings.LastIndexByte(s, ')')
     if l == -1 || r == -1 || r < l {
         // 回退：尽力拆分
-        return strings.Fields(s), nil
+        fields := strings.Fields(s)
+        if len(fields) < 3 {
+            return nil, fmt.Errorf("invalid stat format for pid %d", pid)
+        }
+        return fields, nil
     }
+
     pre := strings.TrimSpace(s[:l])
     comm := s[l+1 : r]
     post := strings.TrimSpace(s[r+1:])
 
-    fields := make([]string, 0, 52)
+    fields := make([]string, 0, DefaultProcessFieldsCapacity)
     if pre != "" {
         fields = append(fields, strings.Fields(pre)...)
     }
@@ -1332,6 +1359,11 @@ func getProcStatFields(pid int) ([]string, error) {
     if post != "" {
         fields = append(fields, strings.Fields(post)...)
     }
+
+    if len(fields) < 3 {
+        return nil, fmt.Errorf("insufficient fields in stat file for pid %d", pid)
+    }
+
     return fields, nil
 }
 
@@ -1432,6 +1464,118 @@ func (c *SimplePortProcessCollector) Update(ch chan<- prometheus.Metric) error {
 	return nil
 }
 
+// 性能优化辅助函数
+// makeSliceWithCapacity 创建带预分配容量的切片，减少内存重新分配
+func makeSliceWithCapacity[T any](capacity int) []T {
+	return make([]T, 0, capacity)
+}
+
+// 性能统计结构体
+type PerformanceStats struct {
+	PortScans        int64     `json:"port_scans"`         // 端口扫描次数
+	ProcessScans     int64     `json:"process_scans"`      // 进程扫描次数
+	CacheHits        int64     `json:"cache_hits"`         // 缓存命中次数
+	CacheMisses      int64     `json:"cache_misses"`       // 缓存未命中次数
+	PanicRecoveries  int64     `json:"panic_recoveries"`   // panic恢复次数
+	LastScanTime     time.Time `json:"last_scan_time"`     // 最后扫描时间
+	AverageScanTime  float64   `json:"average_scan_time"`  // 平均扫描时间(秒)
+	CacheSize        int       `json:"cache_size"`         // 当前缓存大小
+	MemoryUsage      int64     `json:"memory_usage"`       // 内存使用量(字节)
+}
+
+// 全局性能统计
+var performanceStats = struct {
+	sync.RWMutex
+	stats PerformanceStats
+}{
+	stats: PerformanceStats{},
+}
+
+// 更新性能统计
+func updatePerformanceStats(operation string, duration time.Duration) {
+	performanceStats.Lock()
+	defer performanceStats.Unlock()
+
+	switch operation {
+	case "port_scan":
+		performanceStats.stats.PortScans++
+	case "process_scan":
+		performanceStats.stats.ProcessScans++
+	case "cache_hit":
+		performanceStats.stats.CacheHits++
+	case "cache_miss":
+		performanceStats.stats.CacheMisses++
+	case "panic_recovery":
+		performanceStats.stats.PanicRecoveries++
+	}
+
+	performanceStats.stats.LastScanTime = time.Now()
+	if duration > 0 {
+		// 简单的移动平均计算
+		if performanceStats.stats.AverageScanTime == 0 {
+			performanceStats.stats.AverageScanTime = duration.Seconds()
+		} else {
+			performanceStats.stats.AverageScanTime = (performanceStats.stats.AverageScanTime*0.9 + duration.Seconds()*0.1)
+		}
+	}
+}
+
+// 获取性能统计
+func GetPerformanceStats() PerformanceStats {
+	// 获取内存使用量（简化计算）
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+
+	// 获取性能统计
+	performanceStats.RLock()
+	defer performanceStats.RUnlock()
+
+	stats := performanceStats.stats
+	stats.MemoryUsage = int64(memStats.Alloc)
+
+	// 注意：缓存大小计算可能不准确，因为访问多个缓存时没有加锁
+	// 但这避免了锁嵌套问题，对于监控目的来说是可接受的
+	stats.CacheSize = 0 // 暂时设为0，避免数据不一致
+
+	return stats
+}
+
+// 错误恢复辅助函数
+// recoverFromPanic 从panic中恢复并记录错误信息
+func recoverFromPanic(operation string, pid int) {
+	if r := recover(); r != nil {
+		log.Printf("[simple_port_process_collector] %s panic恢复: pid=%d, error=%v", operation, pid, r)
+
+		// 更新性能统计（在锁外执行，避免锁嵌套）
+		go func() {
+			updatePerformanceStats("panic_recovery", 0)
+		}()
+
+		// 根据操作类型设置相应的错误状态
+		switch operation {
+		case "TCP检测":
+			// 设置端口状态为未知
+			portStatusCache.RWMutex.Lock()
+			portStatusCache.Status[pid] = -1
+			portStatusCache.LastCheck[pid] = time.Now()
+			portStatusCache.RWMutex.Unlock()
+		case "进程检测":
+			// 设置进程状态为死亡
+			key := getPidKey(pid)
+			processAliveCache.RWMutex.Lock()
+			processAliveCache.Status[key] = 0
+			processAliveCache.LastCheck[key] = time.Now()
+			processAliveCache.RWMutex.Unlock()
+		case "进程状态检测":
+			// 清理进程详细状态缓存
+			processDetailedStatusCache.Lock()
+			delete(processDetailedStatusCache.cache, pid)
+			delete(processDetailedStatusCache.lastCheck, pid)
+			processDetailedStatusCache.Unlock()
+		}
+	}
+}
+
 // 带缓存的TCP端口存活检测（完全异步化，避免阻塞指标暴露）
 func getPortStatus(port int) int {
 	portStatusCache.RWMutex.RLock()
@@ -1452,9 +1596,10 @@ func getPortStatus(port int) int {
 			// 使用上次检测结果作为临时值
 			return lastAlive
 		}
+		// 没有历史记录，释放读锁
 		portStatusCache.RWMutex.RUnlock()
 
-		// 没有历史记录，加入TCP异步检测队列
+		// 加入TCP异步检测队列
 		tcpDetectionQueue.Lock()
 		tcpDetectionQueue.ports[port] = true
 		tcpDetectionQueue.Unlock()
@@ -1503,7 +1648,7 @@ func cleanDetectionQueues(activePorts map[int]bool, activePidKeys map[string]boo
 	processDetectionQueue.Unlock()
 
 	// 计算需要删除的PID（锁外，允许触发 getPidKey 的磁盘读取）
-	pidsToDelete := make([]int, 0)
+	pidsToDelete := makeSliceWithCapacity[int](len(pidSnapshot))
 	for _, pid := range pidSnapshot {
 		key := getPidKey(pid)
 		if !activePidKeys[key] {
@@ -1527,7 +1672,7 @@ func cleanDetectionQueues(activePorts map[int]bool, activePidKeys map[string]boo
 	}
 	processStatusDetectionQueue.Unlock()
 
-	statusPidsToDelete := make([]int, 0)
+	statusPidsToDelete := makeSliceWithCapacity[int](len(statusPidSnapshot))
 	for _, pid := range statusPidSnapshot {
 		key := getPidKey(pid)
 		if !activePidKeys[key] || !isProcessValid(pid) {
@@ -1555,85 +1700,55 @@ func cleanProcessCaches(activePidKeys map[string]bool) {
 	}
 	processAliveCache.RWMutex.Unlock()
 
-	// 清理进程启动时间缓存
-	pidStartTimeCache.Lock()
-	for pid := range pidStartTimeCache.cache {
-		key := fmt.Sprintf("%d_%s", pid, pidStartTimeCache.cache[pid])
+	// 获取进程启动时间缓存的快照，避免锁嵌套
+	pidStartTimeCache.RLock()
+	pidSnapshot := make(map[int]string)
+	for pid, startTime := range pidStartTimeCache.cache {
+		pidSnapshot[pid] = startTime
+	}
+	pidStartTimeCache.RUnlock()
+
+	// 计算需要删除的PID（锁外操作）
+	pidsToDelete := makeSliceWithCapacity[int](len(pidSnapshot))
+	for pid, startTime := range pidSnapshot {
+		// 使用strings.Builder提高字符串拼接效率
+		var builder strings.Builder
+		builder.Grow(DefaultStringBuilderCapacity) // 预分配容量
+		builder.WriteString(strconv.Itoa(pid))
+		builder.WriteString("_")
+		builder.WriteString(startTime)
+		key := builder.String()
+
 		// 双重检查：既检查活跃PID键，也检查进程是否仍然有效
 		if !activePidKeys[key] || !isProcessValid(pid) {
-			delete(pidStartTimeCache.cache, pid)
+			pidsToDelete = append(pidsToDelete, pid)
 		}
 	}
-	pidStartTimeCache.Unlock()
 
-	// 清理进程状态缓存 - 避免锁嵌套
-	// 先获取快照，避免锁嵌套
+	// 批量删除进程启动时间缓存
+	if len(pidsToDelete) > 0 {
+		pidStartTimeCache.Lock()
+		for _, pid := range pidsToDelete {
+			delete(pidStartTimeCache.cache, pid)
+		}
+		pidStartTimeCache.Unlock()
+	}
+
+	// 清理进程状态缓存
 	processStatusCache.Lock()
-	pidSnapshot := make([]int, 0, len(processStatusCache.cache))
-	for pid := range processStatusCache.cache {
-		pidSnapshot = append(pidSnapshot, pid)
+	for _, pid := range pidsToDelete {
+		delete(processStatusCache.cache, pid)
+		delete(processStatusCache.lastCheck, pid)
 	}
 	processStatusCache.Unlock()
 
-	// 锁外计算需要删除的PID
-	pidsToDelete := make([]int, 0)
-	pidStartTimeCache.RLock()
-	for _, pid := range pidSnapshot {
-		startTime, exists := pidStartTimeCache.cache[pid]
-		if !exists || !isProcessValid(pid) {
-			pidsToDelete = append(pidsToDelete, pid)
-			continue
-		}
-		key := fmt.Sprintf("%d_%s", pid, startTime)
-		if !activePidKeys[key] {
-			pidsToDelete = append(pidsToDelete, pid)
-		}
-	}
-	pidStartTimeCache.RUnlock()
-
-	// 批量删除
-	if len(pidsToDelete) > 0 {
-		processStatusCache.Lock()
-		for _, pid := range pidsToDelete {
-			delete(processStatusCache.cache, pid)
-			delete(processStatusCache.lastCheck, pid)
-		}
-		processStatusCache.Unlock()
-	}
-
-	// 清理进程详细状态缓存 - 避免锁嵌套
+	// 清理进程详细状态缓存
 	processDetailedStatusCache.Lock()
-	detailedPidSnapshot := make([]int, 0, len(processDetailedStatusCache.cache))
-	for pid := range processDetailedStatusCache.cache {
-		detailedPidSnapshot = append(detailedPidSnapshot, pid)
+	for _, pid := range pidsToDelete {
+		delete(processDetailedStatusCache.cache, pid)
+		delete(processDetailedStatusCache.lastCheck, pid)
 	}
 	processDetailedStatusCache.Unlock()
-
-	// 锁外计算需要删除的PID
-	detailedPidsToDelete := make([]int, 0)
-	pidStartTimeCache.RLock()
-	for _, pid := range detailedPidSnapshot {
-		startTime, exists := pidStartTimeCache.cache[pid]
-		if !exists || !isProcessValid(pid) {
-			detailedPidsToDelete = append(detailedPidsToDelete, pid)
-			continue
-		}
-		key := fmt.Sprintf("%d_%s", pid, startTime)
-		if !activePidKeys[key] {
-			detailedPidsToDelete = append(detailedPidsToDelete, pid)
-		}
-	}
-	pidStartTimeCache.RUnlock()
-
-	// 批量删除
-	if len(detailedPidsToDelete) > 0 {
-		processDetailedStatusCache.Lock()
-		for _, pid := range detailedPidsToDelete {
-			delete(processDetailedStatusCache.cache, pid)
-			delete(processDetailedStatusCache.lastCheck, pid)
-		}
-		processDetailedStatusCache.Unlock()
-	}
 
 	// 清理进程身份缓存（基于进程名+路径，解决服务重启问题）
 	processIdentityCache.Lock()
@@ -1669,83 +1784,54 @@ func cleanStatusCaches(activePorts map[int]bool, activePidKeys map[string]bool) 
 	}
 	processAliveCache.RWMutex.Unlock()
 
-	// 清理进程启动时间缓存
-	pidStartTimeCache.Lock()
-	for pid := range pidStartTimeCache.cache {
-		key := fmt.Sprintf("%d_%s", pid, pidStartTimeCache.cache[pid])
-		if !activePidKeys[key] {
-			delete(pidStartTimeCache.cache, pid)
-		}
-	}
-	pidStartTimeCache.Unlock()
-
-	// 清理进程状态缓存 - 避免锁嵌套
-	processStatusCache.Lock()
-	statusPidSnapshot := make([]int, 0, len(processStatusCache.cache))
-	for pid := range processStatusCache.cache {
-		statusPidSnapshot = append(statusPidSnapshot, pid)
-	}
-	processStatusCache.Unlock()
-
-	// 锁外计算需要删除的PID
-	statusPidsToDelete := make([]int, 0)
+	// 获取进程启动时间缓存的快照，避免锁嵌套
 	pidStartTimeCache.RLock()
-	for _, pid := range statusPidSnapshot {
-		startTime, exists := pidStartTimeCache.cache[pid]
-		if !exists {
-			statusPidsToDelete = append(statusPidsToDelete, pid)
-			continue
-		}
-		key := fmt.Sprintf("%d_%s", pid, startTime)
-		if !activePidKeys[key] {
-			statusPidsToDelete = append(statusPidsToDelete, pid)
-		}
+	pidSnapshot := make(map[int]string)
+	for pid, startTime := range pidStartTimeCache.cache {
+		pidSnapshot[pid] = startTime
 	}
 	pidStartTimeCache.RUnlock()
 
-	// 批量删除
-	if len(statusPidsToDelete) > 0 {
-		processStatusCache.Lock()
-		for _, pid := range statusPidsToDelete {
-			delete(processStatusCache.cache, pid)
-			delete(processStatusCache.lastCheck, pid)
+	// 计算需要删除的PID（锁外操作）
+	pidsToDelete := makeSliceWithCapacity[int](len(pidSnapshot))
+	for pid, startTime := range pidSnapshot {
+		// 使用strings.Builder提高字符串拼接效率
+		var builder strings.Builder
+		builder.Grow(DefaultStringBuilderCapacity) // 预分配容量
+		builder.WriteString(strconv.Itoa(pid))
+		builder.WriteString("_")
+		builder.WriteString(startTime)
+		key := builder.String()
+
+		if !activePidKeys[key] {
+			pidsToDelete = append(pidsToDelete, pid)
 		}
-		processStatusCache.Unlock()
 	}
 
-	// 清理进程详细状态缓存 - 避免锁嵌套
+	// 批量删除进程启动时间缓存
+	if len(pidsToDelete) > 0 {
+		pidStartTimeCache.Lock()
+		for _, pid := range pidsToDelete {
+			delete(pidStartTimeCache.cache, pid)
+		}
+		pidStartTimeCache.Unlock()
+	}
+
+	// 清理进程状态缓存
+	processStatusCache.Lock()
+	for _, pid := range pidsToDelete {
+		delete(processStatusCache.cache, pid)
+		delete(processStatusCache.lastCheck, pid)
+	}
+	processStatusCache.Unlock()
+
+	// 清理进程详细状态缓存
 	processDetailedStatusCache.Lock()
-	detailedStatusPidSnapshot := make([]int, 0, len(processDetailedStatusCache.cache))
-	for pid := range processDetailedStatusCache.cache {
-		detailedStatusPidSnapshot = append(detailedStatusPidSnapshot, pid)
+	for _, pid := range pidsToDelete {
+		delete(processDetailedStatusCache.cache, pid)
+		delete(processDetailedStatusCache.lastCheck, pid)
 	}
 	processDetailedStatusCache.Unlock()
-
-	// 锁外计算需要删除的PID
-	detailedStatusPidsToDelete := make([]int, 0)
-	pidStartTimeCache.RLock()
-	for _, pid := range detailedStatusPidSnapshot {
-		startTime, exists := pidStartTimeCache.cache[pid]
-		if !exists {
-			detailedStatusPidsToDelete = append(detailedStatusPidsToDelete, pid)
-			continue
-		}
-		key := fmt.Sprintf("%d_%s", pid, startTime)
-		if !activePidKeys[key] {
-			detailedStatusPidsToDelete = append(detailedStatusPidsToDelete, pid)
-		}
-	}
-		pidStartTimeCache.RUnlock()
-
-	// 批量删除
-	if len(detailedStatusPidsToDelete) > 0 {
-		processDetailedStatusCache.Lock()
-		for _, pid := range detailedStatusPidsToDelete {
-			delete(processDetailedStatusCache.cache, pid)
-			delete(processDetailedStatusCache.lastCheck, pid)
-		}
-		processDetailedStatusCache.Unlock()
-	}
 }
 
 // 带缓存的进程存活检测（完全异步化，避免阻塞指标暴露）
@@ -1769,9 +1855,10 @@ func getProcessAliveStatus(pid int) int {
 			// 使用上次检测结果作为临时值
 			return lastStatus
 		}
+		// 没有历史记录，释放读锁
 		processAliveCache.RWMutex.RUnlock()
 
-		// 没有历史记录，加入进程异步检测队列
+		// 加入进程异步检测队列
 		processDetectionQueue.Lock()
 		processDetectionQueue.pids[pid] = true
 		processDetectionQueue.Unlock()
@@ -1789,7 +1876,13 @@ func getPidKey(pid int) string {
 	pidStartTimeCache.RLock()
 	if startTime, exists := pidStartTimeCache.cache[pid]; exists {
 		pidStartTimeCache.RUnlock()
-		return fmt.Sprintf("%d_%s", pid, startTime)
+		// 使用strings.Builder提高字符串拼接效率
+		var builder strings.Builder
+		builder.Grow(DefaultStringBuilderCapacity) // 预分配容量
+		builder.WriteString(strconv.Itoa(pid))
+		builder.WriteString("_")
+		builder.WriteString(startTime)
+		return builder.String()
 	}
 	pidStartTimeCache.RUnlock()
 
@@ -1798,7 +1891,13 @@ func getPidKey(pid int) string {
 	pidStartTimeCache.cache[pid] = startTime
 	pidStartTimeCache.Unlock()
 
-	return fmt.Sprintf("%d_%s", pid, startTime)
+	// 使用strings.Builder提高字符串拼接效率
+	var builder strings.Builder
+	builder.Grow(len(startTime) + 10) // 预分配容量
+	builder.WriteString(strconv.Itoa(pid))
+	builder.WriteString("_")
+	builder.WriteString(startTime)
+	return builder.String()
 }
 
 // 字符串缓存结构体，包含缓存映射和访问时间戳
@@ -1816,34 +1915,28 @@ var stringCache = struct {
 // 该函数使用带时间戳的缓存机制，记录每次访问时间
 // 用于后续的基于时间戳的缓存清理策略
 func getProcessIdentityKey(processName, exePath string) string {
-	key := processName + "|" + exePath
+	// 使用strings.Builder提高字符串拼接效率
+	var builder strings.Builder
+	builder.Grow(DefaultStringBuilderCapacity) // 预分配容量
+	builder.WriteString(processName)
+	builder.WriteString("|")
+	builder.WriteString(exePath)
+	key := builder.String()
 
-	stringCache.RLock()
+	stringCache.Lock()
+	defer stringCache.Unlock()
+
 	if cached, exists := stringCache.cache[key]; exists {
-		// 更新访问时间戳（在持有读锁的情况下更新，避免竞态条件）
-		stringCache.RUnlock()
-		stringCache.Lock()
-		// 双重检查：确保缓存项仍然存在
-		if _, stillExists := stringCache.cache[key]; stillExists {
-			stringCache.accessTime[key] = time.Now()
-		}
-		stringCache.Unlock()
+		// 更新访问时间戳
+		stringCache.accessTime[key] = time.Now()
+		updatePerformanceStats("cache_hit", 0)
 		return cached
 	}
-	stringCache.RUnlock()
 
 	// 缓存未命中，创建新字符串并缓存
-	stringCache.Lock()
-	// 双重检查
-	if cached, exists := stringCache.cache[key]; exists {
-		stringCache.accessTime[key] = time.Now()
-		stringCache.Unlock()
-		return cached
-	}
 	stringCache.cache[key] = key
 	stringCache.accessTime[key] = time.Now()
-	stringCache.Unlock()
-
+	updatePerformanceStats("cache_miss", 0)
 	return key
 }
 
@@ -1981,21 +2074,36 @@ func getProcessIdentityStatus(processName, exePath string) (int, string) {
 }
 
 // findAliveProcessInGroup 在进程组中查找存活的进程
+// 优化版本：使用缓存减少文件系统访问
 func findAliveProcessInGroup(processName, exePath string) int {
-	// 直接扫描 /proc 目录查找所有进程，不依赖端口信息
+	// 首先尝试从当前端口进程信息中查找，避免全量扫描
+	infos := getPortProcessInfo()
+	for _, info := range infos {
+		if info.ProcessName == processName && info.ExePath == exePath {
+			// 检查进程是否仍然存活
+			if checkProcess(info.Pid) == 1 {
+				return info.Pid
+			}
+		}
+	}
+
+	// 如果端口信息中没有找到，再进行全量扫描
 	procDir, err := os.Open(procPath("/proc"))
 	if err != nil {
 		log.Printf("[simple_port_process_collector] 无法打开/proc目录: %v", err)
 		return 0
 	}
-	defer procDir.Close()
+	defer func() {
+		if closeErr := procDir.Close(); closeErr != nil {
+			log.Printf("[simple_port_process_collector] 无法关闭/proc目录: %v", closeErr)
+		}
+	}()
 
 	entries, err := procDir.Readdir(-1)
 	if err != nil {
 		log.Printf("[simple_port_process_collector] 无法读取/proc目录: %v", err)
 		return 0
 	}
-
 
 	// 查找同组中的存活进程
 	for _, entry := range entries {
@@ -2110,7 +2218,7 @@ func startProcessStatusDetectionWorker() {
 				return
 			case <-ticker.C:
 				processStatusDetectionQueue.Lock()
-				pids := make([]int, 0, len(processStatusDetectionQueue.pids))
+				pids := makeSliceWithCapacity[int](len(processStatusDetectionQueue.pids))
 				for pid := range processStatusDetectionQueue.pids {
 					pids = append(pids, pid)
 				}
@@ -2124,17 +2232,7 @@ func startProcessStatusDetectionWorker() {
 					wg.Add(1)
 					go func(p int) {
 						defer wg.Done()
-						defer func() {
-							if r := recover(); r != nil {
-								log.Printf("[simple_port_process_collector] 进程状态检测panic恢复: pid=%d, error=%v", p, r)
-								// panic恢复后清理缓存，避免使用错误数据
-								processDetailedStatusCache.Lock()
-								delete(processDetailedStatusCache.cache, p)
-								delete(processDetailedStatusCache.lastCheck, p)
-								processDetailedStatusCache.Unlock()
-								return
-							}
-						}()
+						defer recoverFromPanic("进程状态检测", p)
 
 						// 在检测前先验证PID是否仍然有效，避免处理已死亡的进程
 						if !isProcessValid(p) {
@@ -2174,11 +2272,12 @@ func startMemoryCleanupWorker() {
 		// 无限循环处理清理任务
 		for {
 			select {
+			case <-memoryCleanupQueue.done:
+				// 收到关闭信号，退出工作器
+				return
 			case <-ticker.C:
 				// 定时器触发，执行缓存清理
 				cleanupExpiredCaches()
-			// 注意：这里缺少done通道处理，但内存清理工作器通常不需要优雅关闭
-			// 因为它是系统级别的清理任务，应该在程序退出时自然停止
 			}
 		}
 	}()
@@ -2201,7 +2300,7 @@ func cleanupExpiredCaches() {
 			accessTime time.Time     // 最后访问时间
 		}
 
-		var items []cacheItem
+		items := make([]cacheItem, 0, len(stringCache.accessTime))
 		for key, accessTime := range stringCache.accessTime {
 			items = append(items, cacheItem{key: key, accessTime: accessTime})
 		}
@@ -2313,7 +2412,7 @@ func getProcessDetailedStatusData(pid int) *ProcessDetailedStatus {
 	memTotal, err := getSystemMemTotal()
 	if err != nil {
 		log.Printf("[simple_port_process_collector] 获取系统内存总量失败: %v", err)
-		memTotal = 1 // 防止除零
+		memTotal = 1024 * 1024 // 使用1GB作为默认值，防止除零
 	}
 
 	// 计算增量值
@@ -2325,7 +2424,7 @@ func getProcessDetailedStatusData(pid int) *ProcessDetailedStatus {
 
 	if exists && cache != nil {
 		timeDiff := now.Sub(cache.LastUpdate).Seconds()
-		if timeDiff > 0 {
+		if timeDiff > 0 && ticksPerSecond > 0 {
 			// CPU使用率计算：基于累计CPU时间差值（utime/stime为ticks），换算为秒再转百分比
 			totalCPUDiff := (utime - cache.LastUtime) + (stime - cache.LastStime)
 			// 单核百分比： (ticksDiff / ticksPerSecond) / interval * 100
@@ -2363,7 +2462,12 @@ func getProcessDetailedStatusData(pid int) *ProcessDetailedStatus {
 	}
 	voluntary := parseProcessStatusValue(statusData["voluntary_ctxt_switches"])
 	nonvoluntary := parseProcessStatusValue(statusData["nonvoluntary_ctxt_switches"])
-	memPercent := vmrss / memTotal * 100
+
+	// 安全计算内存百分比，防止除零
+	var memPercent float64
+	if memTotal > 0 {
+		memPercent = vmrss / memTotal * 100
+	}
 
 	return &ProcessDetailedStatus{
 		CPUPercent:     cpuPercent,
@@ -2396,7 +2500,7 @@ func getProcessStatFallback(pid int) (float64, float64, float64, error) {
     }
     // 需要至少到 rss 字段（1-based 24 => 0-based 23）
     if len(fields) < 24 {
-        return 0, 0, 0, fmt.Errorf("invalid stat format")
+        return 0, 0, 0, fmt.Errorf("invalid stat format: insufficient fields")
     }
 
     var (
@@ -2405,14 +2509,21 @@ func getProcessStatFallback(pid int) (float64, float64, float64, error) {
         vsizeBytes float64
     )
 
-    if v, err := strconv.ParseFloat(fields[19], 64); err == nil { // 1-based 20 num_threads
-        threadsVal = v
+    // 安全解析字段，处理解析错误
+    if len(fields) > 19 {
+        if v, err := strconv.ParseFloat(fields[19], 64); err == nil { // 1-based 20 num_threads
+            threadsVal = v
+        }
     }
-    if v, err := strconv.ParseFloat(fields[23], 64); err == nil { // 1-based 24 rss (pages)
-        rssPages = v
+    if len(fields) > 23 {
+        if v, err := strconv.ParseFloat(fields[23], 64); err == nil { // 1-based 24 rss (pages)
+            rssPages = v
+        }
     }
-    if v, err := strconv.ParseFloat(fields[22], 64); err == nil { // 1-based 23 vsize (bytes)
-        vsizeBytes = v
+    if len(fields) > 22 {
+        if v, err := strconv.ParseFloat(fields[22], 64); err == nil { // 1-based 23 vsize (bytes)
+            vsizeBytes = v
+        }
     }
 
     pageSizeKB := float64(os.Getpagesize()) / 1024.0
@@ -2462,13 +2573,31 @@ func getProcessCPUAndFaults(pid int) (float64, float64, float64, float64, error)
         return 0, 0, 0, 0, err
     }
     if len(fields) < 24 {
-		return 0, 0, 0, 0, fmt.Errorf("invalid stat format")
+		return 0, 0, 0, 0, fmt.Errorf("invalid stat format: insufficient fields")
 	}
 
-	utime, _ := strconv.ParseFloat(fields[13], 64)
-	stime, _ := strconv.ParseFloat(fields[14], 64)
-	minflt, _ := strconv.ParseFloat(fields[9], 64)
-	majflt, _ := strconv.ParseFloat(fields[11], 64)
+	// 安全解析字段，处理解析错误
+	var utime, stime, minflt, majflt float64
+	if len(fields) > 13 {
+		if v, err := strconv.ParseFloat(fields[13], 64); err == nil {
+			utime = v
+		}
+	}
+	if len(fields) > 14 {
+		if v, err := strconv.ParseFloat(fields[14], 64); err == nil {
+			stime = v
+		}
+	}
+	if len(fields) > 9 {
+		if v, err := strconv.ParseFloat(fields[9], 64); err == nil {
+			minflt = v
+		}
+	}
+	if len(fields) > 11 {
+		if v, err := strconv.ParseFloat(fields[11], 64); err == nil {
+			majflt = v
+		}
+	}
 
 	// 返回原始值，不除以100，在CPU计算时再处理
 	return utime, stime, minflt, majflt, nil
@@ -2521,6 +2650,9 @@ func parseProcessStatusValue(value string) float64 {
 	}
 	// 只取第一个数字部分
 	fields := strings.Fields(value)
+	if len(fields) == 0 {
+		return 0
+	}
 	f, err := strconv.ParseFloat(fields[0], 64)
 	if err != nil {
 		return 0
@@ -2548,6 +2680,7 @@ func getProcessDetailedStatusCached(pid int) *ProcessDetailedStatus {
 			// 使用上次检测结果作为临时值
 			return lastStatus
 		}
+		// 没有历史记录，释放读锁
 		processDetailedStatusCache.RUnlock()
 
 		// 没有历史记录，使用原子操作避免竞态条件
@@ -2591,8 +2724,6 @@ func getProcessDetailedStatusCached(pid int) *ProcessDetailedStatus {
 					processDetailedStatusCache.lastCheck[pid] = now
 				}
 			}
-			processDetailedStatusCache.Unlock()
-		} else {
 			processDetailedStatusCache.Unlock()
 		}
 
