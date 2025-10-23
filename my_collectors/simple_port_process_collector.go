@@ -527,6 +527,14 @@ func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 		processGroups[groupKey] = append(processGroups[groupKey], info)
 	}
 
+	// 获取所有进程（包括没有端口监听的进程）用于性能指标计算
+	allProcesses := getAllProcesses()
+	allProcessGroups := make(map[string][]PortProcessInfo)
+	for _, proc := range allProcesses {
+		groupKey := proc.ProcessName + "|" + proc.ExePath
+		allProcessGroups[groupKey] = append(allProcessGroups[groupKey], proc)
+	}
+
 	for _, info := range infos {
 		// 只处理TCP协议
 		if info.Protocol == "tcp" {
@@ -610,6 +618,153 @@ func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 			}
 		}
 	}
+
+	// 处理所有进程的性能指标（包括没有端口监听的进程）
+	for groupKey, groupInfos := range allProcessGroups {
+		if !reportedGroupKeys[groupKey] {
+			// 计算性能指标
+			aggregatedStatus := calculateProcessGroupAggregation(groupInfos[0].ProcessName, groupInfos)
+
+			// 更新进程身份信息
+			if len(groupInfos) > 0 {
+				selectedPid := selectBestPidForIdentity(groupInfos)
+				updateProcessIdentity(groupInfos[0].ProcessName, groupInfos[0].ExePath, selectedPid)
+			}
+
+			// 获取进程状态
+			overallAlive, firstAliveState := getProcessIdentityStatus(groupInfos[0].ProcessName, groupInfos[0].ExePath)
+
+			if overallAlive >= 0 {
+				// 进程存活状态
+				ch <- prometheus.MustNewConstMetric(
+					c.processAliveDesc, prometheus.GaugeValue, float64(overallAlive),
+					groupInfos[0].ProcessName, groupInfos[0].ExePath, firstAliveState,
+				)
+
+				// 性能指标
+				ch <- prometheus.MustNewConstMetric(
+					c.processCPUPercentDesc, prometheus.GaugeValue, aggregatedStatus.TotalCPUPercent,
+					groupInfos[0].ProcessName, groupInfos[0].ExePath,
+				)
+
+				ch <- prometheus.MustNewConstMetric(
+					c.processMemPercentDesc, prometheus.GaugeValue, aggregatedStatus.TotalMemPercent,
+					groupInfos[0].ProcessName, groupInfos[0].ExePath,
+				)
+
+				ch <- prometheus.MustNewConstMetric(
+					c.processVMRSSDesc, prometheus.GaugeValue, aggregatedStatus.TotalVMRSS*1024,
+					groupInfos[0].ProcessName, groupInfos[0].ExePath,
+				)
+
+				ch <- prometheus.MustNewConstMetric(
+					c.processVMSizeDesc, prometheus.GaugeValue, aggregatedStatus.TotalVMSize*1024,
+					groupInfos[0].ProcessName, groupInfos[0].ExePath,
+				)
+
+				ch <- prometheus.MustNewConstMetric(
+					c.processThreadsDesc, prometheus.GaugeValue, aggregatedStatus.TotalThreads,
+					groupInfos[0].ProcessName, groupInfos[0].ExePath,
+				)
+
+				ch <- prometheus.MustNewConstMetric(
+					c.processIOReadDesc, prometheus.GaugeValue, aggregatedStatus.TotalIORead*1024,
+					groupInfos[0].ProcessName, groupInfos[0].ExePath,
+				)
+
+				ch <- prometheus.MustNewConstMetric(
+					c.processIOWriteDesc, prometheus.GaugeValue, aggregatedStatus.TotalIOWrite*1024,
+					groupInfos[0].ProcessName, groupInfos[0].ExePath,
+				)
+			}
+		}
+	}
+}
+
+// 所有进程缓存
+var allProcessCache = struct {
+	LastScan time.Time
+	Data     []PortProcessInfo
+	RWMutex  sync.RWMutex
+}{}
+
+// getAllProcesses 获取所有进程信息（包括没有端口监听的进程），带缓存机制
+func getAllProcesses() []PortProcessInfo {
+	allProcessCache.RWMutex.RLock()
+	expired := time.Since(allProcessCache.LastScan) > scanInterval || len(allProcessCache.Data) == 0
+	allProcessCache.RWMutex.RUnlock()
+
+	if expired {
+		var dataCopy []PortProcessInfo
+		allProcessCache.RWMutex.Lock()
+		// 再次检查，防止并发下重复扫描
+		if time.Since(allProcessCache.LastScan) > scanInterval || len(allProcessCache.Data) == 0 {
+			allProcessCache.Data = discoverAllProcesses()
+			allProcessCache.LastScan = time.Now()
+			// 复制一份用于锁外清理，避免长时间持有写锁
+			dataCopy = append([]PortProcessInfo(nil), allProcessCache.Data...)
+		}
+		allProcessCache.RWMutex.Unlock()
+	}
+
+	allProcessCache.RWMutex.RLock()
+	defer allProcessCache.RWMutex.RUnlock()
+	return allProcessCache.Data
+}
+
+// discoverAllProcesses 发现所有进程（包括没有端口监听的进程）
+func discoverAllProcesses() []PortProcessInfo {
+	var results []PortProcessInfo
+
+	procDir, err := os.Open(procPath("/proc"))
+	if err != nil {
+		log.Printf("[simple_port_process_collector] 无法打开/proc目录: %v", err)
+		return results
+	}
+	defer procDir.Close()
+
+	entries, err := procDir.Readdir(-1)
+	if err != nil {
+		log.Printf("[simple_port_process_collector] 无法读取/proc目录: %v", err)
+		return results
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+
+		// 检查进程是否存活
+		status := checkProcess(pid)
+		if status != 1 {
+			continue // 跳过不存活的进程
+		}
+
+		// 获取进程信息
+		exePath := getProcessExe(pid)
+		exeName := filepath.Base(exePath)
+
+		// 跳过排除的进程
+		if isExcludedProcess(exeName) {
+			continue
+		}
+
+		results = append(results, PortProcessInfo{
+			ProcessName: safeLabel(exeName),
+			ExePath:     safeLabel(exePath),
+			Port:        0, // 没有端口监听
+			Pid:         pid,
+			WorkDir:     safeLabel(getProcessCwd(pid)),
+			Username:    safeLabel(getProcessUser(pid)),
+			Protocol:    "none", // 没有协议
+		})
+	}
+
+	return results
 }
 
 // getPortProcessInfo 函数：获取端口与进程信息，带缓存机制
@@ -1276,11 +1431,9 @@ func getProcessIdentityStatus(processName, exePath string) (int, string) {
 
 	if !exists {
 		// 未找到进程身份，尝试直接查找当前进程
-		log.Printf("[simple_port_process_collector] 进程身份不存在，查找存活进程: processName=%s, exePath=%s", processName, exePath)
 		alivePid := findAliveProcessInGroup(processName, exePath)
 		if alivePid > 0 {
 			// 找到存活进程，创建新的身份信息
-			log.Printf("[simple_port_process_collector] 创建新进程身份: pid=%d", alivePid)
 			processIdentityCache.Lock()
 			processIdentityCache.cache[key] = ProcessIdentity{
 				ProcessName: processName,
@@ -1292,7 +1445,6 @@ func getProcessIdentityStatus(processName, exePath string) (int, string) {
 			processIdentityCache.Unlock()
 			return 1, "R" // 进程存活（新发现）
 		}
-		log.Printf("[simple_port_process_collector] 未找到存活进程: processName=%s, exePath=%s", processName, exePath)
 		return -1, "X" // 未找到进程
 	}
 
@@ -1363,7 +1515,6 @@ func findAliveProcessInGroup(processName, exePath string) int {
 		return 0
 	}
 
-	log.Printf("[simple_port_process_collector] 查找进程组: processName=%s, exePath=%s", processName, exePath)
 
 	// 查找同组中的存活进程
 	for _, entry := range entries {
@@ -1384,12 +1535,10 @@ func findAliveProcessInGroup(processName, exePath string) int {
 		// 检查进程名和路径是否匹配
 		currentExePath := getProcessExe(pid)
 		if currentExePath == exePath {
-			log.Printf("[simple_port_process_collector] 找到匹配的存活进程: pid=%d, exePath=%s", pid, currentExePath)
 			return pid
 		}
 	}
 
-	log.Printf("[simple_port_process_collector] 未找到匹配的存活进程: processName=%s, exePath=%s", processName, exePath)
 	return 0 // 没有找到存活的进程
 }
 
