@@ -1679,72 +1679,73 @@ func cleanStatusCaches(activePorts map[int]bool, activePidKeys map[string]bool) 
 	}
 	pidStartTimeCache.Unlock()
 
-// 清理进程状态缓存 - 避免锁嵌套
-processStatusCache.Lock()
+	// 清理进程状态缓存 - 避免锁嵌套
+	processStatusCache.Lock()
 	statusPidSnapshot := make([]int, 0, len(processStatusCache.cache))
 	for pid := range processStatusCache.cache {
 		statusPidSnapshot = append(statusPidSnapshot, pid)
 	}
-processStatusCache.Unlock()
-
-// 锁外计算需要删除的PID
-statusPidsToDelete := make([]int, 0)
-pidStartTimeCache.RLock()
-for _, pid := range statusPidSnapshot {
-	startTime, exists := pidStartTimeCache.cache[pid]
-	if !exists {
-		statusPidsToDelete = append(statusPidsToDelete, pid)
-		continue
-	}
-	key := fmt.Sprintf("%d_%s", pid, startTime)
-	if !activePidKeys[key] {
-		statusPidsToDelete = append(statusPidsToDelete, pid)
-	}
-}
-pidStartTimeCache.RUnlock()
-
-// 批量删除
-if len(statusPidsToDelete) > 0 {
-	processStatusCache.Lock()
-	for _, pid := range statusPidsToDelete {
-		delete(processStatusCache.cache, pid)
-		delete(processStatusCache.lastCheck, pid)
-	}
 	processStatusCache.Unlock()
-}
 
-// 清理进程详细状态缓存 - 避免锁嵌套
-processDetailedStatusCache.Lock()
+	// 锁外计算需要删除的PID
+	statusPidsToDelete := make([]int, 0)
+	pidStartTimeCache.RLock()
+	for _, pid := range statusPidSnapshot {
+		startTime, exists := pidStartTimeCache.cache[pid]
+		if !exists {
+			statusPidsToDelete = append(statusPidsToDelete, pid)
+			continue
+		}
+		key := fmt.Sprintf("%d_%s", pid, startTime)
+		if !activePidKeys[key] {
+			statusPidsToDelete = append(statusPidsToDelete, pid)
+		}
+	}
+	pidStartTimeCache.RUnlock()
+
+	// 批量删除
+	if len(statusPidsToDelete) > 0 {
+		processStatusCache.Lock()
+		for _, pid := range statusPidsToDelete {
+			delete(processStatusCache.cache, pid)
+			delete(processStatusCache.lastCheck, pid)
+		}
+		processStatusCache.Unlock()
+	}
+
+	// 清理进程详细状态缓存 - 避免锁嵌套
+	processDetailedStatusCache.Lock()
 	detailedStatusPidSnapshot := make([]int, 0, len(processDetailedStatusCache.cache))
 	for pid := range processDetailedStatusCache.cache {
 		detailedStatusPidSnapshot = append(detailedStatusPidSnapshot, pid)
 	}
-processDetailedStatusCache.Unlock()
-
-// 锁外计算需要删除的PID
-detailedStatusPidsToDelete := make([]int, 0)
-pidStartTimeCache.RLock()
-for _, pid := range detailedStatusPidSnapshot {
-	startTime, exists := pidStartTimeCache.cache[pid]
-	if !exists {
-		detailedStatusPidsToDelete = append(detailedStatusPidsToDelete, pid)
-		continue
-	}
-	key := fmt.Sprintf("%d_%s", pid, startTime)
-	if !activePidKeys[key] {
-		detailedStatusPidsToDelete = append(detailedStatusPidsToDelete, pid)
-	}
-}
-pidStartTimeCache.RUnlock()
-
-// 批量删除
-if len(detailedStatusPidsToDelete) > 0 {
-	processDetailedStatusCache.Lock()
-	for _, pid := range detailedStatusPidsToDelete {
-		delete(processDetailedStatusCache.cache, pid)
-		delete(processDetailedStatusCache.lastCheck, pid)
-	}
 	processDetailedStatusCache.Unlock()
+
+	// 锁外计算需要删除的PID
+	detailedStatusPidsToDelete := make([]int, 0)
+	pidStartTimeCache.RLock()
+	for _, pid := range detailedStatusPidSnapshot {
+		startTime, exists := pidStartTimeCache.cache[pid]
+		if !exists {
+			detailedStatusPidsToDelete = append(detailedStatusPidsToDelete, pid)
+			continue
+		}
+		key := fmt.Sprintf("%d_%s", pid, startTime)
+		if !activePidKeys[key] {
+			detailedStatusPidsToDelete = append(detailedStatusPidsToDelete, pid)
+		}
+	}
+		pidStartTimeCache.RUnlock()
+
+	// 批量删除
+	if len(detailedStatusPidsToDelete) > 0 {
+		processDetailedStatusCache.Lock()
+		for _, pid := range detailedStatusPidsToDelete {
+			delete(processDetailedStatusCache.cache, pid)
+			delete(processDetailedStatusCache.lastCheck, pid)
+		}
+		processDetailedStatusCache.Unlock()
+	}
 }
 
 // 带缓存的进程存活检测（完全异步化，避免阻塞指标暴露）
