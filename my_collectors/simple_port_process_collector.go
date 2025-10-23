@@ -1,6 +1,7 @@
 package my_collectors
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"log"
@@ -68,21 +69,69 @@ func procPath(path string) string {
 
 // SimplePortProcessCollector 结构体：实现 Prometheus Collector 接口
 type SimplePortProcessCollector struct {
-	portTCPAliveDesc *prometheus.Desc // TCP端口存活指标描述符
-	processAliveDesc *prometheus.Desc // 进程存活指标描述符
+	portTCPAliveDesc      *prometheus.Desc // TCP端口存活指标描述符
+	processAliveDesc      *prometheus.Desc // 进程存活指标描述符
+	processStatusDesc     *prometheus.Desc // 进程状态指标描述符
+	processCPUPercentDesc *prometheus.Desc // 进程CPU使用率指标描述符
+	processMemPercentDesc *prometheus.Desc // 进程内存使用率指标描述符
+	processVMRSSDesc      *prometheus.Desc // 进程物理内存指标描述符
+	processVMSizeDesc     *prometheus.Desc // 进程虚拟内存指标描述符
+	processThreadsDesc    *prometheus.Desc // 进程线程数指标描述符
+	processIOReadDesc     *prometheus.Desc // 进程IO读取指标描述符
+	processIOWriteDesc    *prometheus.Desc // 进程IO写入指标描述符
 }
 
 // NewSimplePortProcessCollector 构造函数：创建并返回一个新的简化端口进程采集器
 func NewSimplePortProcessCollector() *SimplePortProcessCollector {
 	return &SimplePortProcessCollector{
 		portTCPAliveDesc: prometheus.NewDesc(
-			"node_tcp_port_alive",
-			"TCP Port alive status (1=alive, 0=dead)",
+			"node_tcp_port_alive",                    // 指标名称
+			"TCP端口存活状态 (1=存活, 0=死亡)",           // 指标描述
 			[]string{"process_name", "exe_path", "port"}, nil,
 		),
 		processAliveDesc: prometheus.NewDesc(
-			"node_process_alive",
-			"Process alive status (1=alive, 0=dead)",
+			"node_process_alive",                     // 指标名称
+			"进程存活状态 (1=存活, 0=死亡)",             // 指标描述
+			[]string{"process_name", "exe_path"}, nil,
+		),
+		processStatusDesc: prometheus.NewDesc(
+			"node_process_status",                    // 指标名称
+			"进程详细状态 (1=存活, 0=死亡) 包含进程状态",  // 指标描述
+			[]string{"process_name", "exe_path", "state"}, nil,
+		),
+		processCPUPercentDesc: prometheus.NewDesc(
+			"node_process_cpu_percent",               // 指标名称
+			"进程CPU使用率百分比",                      // 指标描述
+			[]string{"process_name", "exe_path"}, nil,
+		),
+		processMemPercentDesc: prometheus.NewDesc(
+			"node_process_memory_percent",            // 指标名称
+			"进程物理内存使用率百分比",                  // 指标描述
+			[]string{"process_name", "exe_path"}, nil,
+		),
+		processVMRSSDesc: prometheus.NewDesc(
+			"node_process_memory_rss_bytes",          // 指标名称
+			"进程使用的物理内存大小(字节)",              // 指标描述
+			[]string{"process_name", "exe_path"}, nil,
+		),
+		processVMSizeDesc: prometheus.NewDesc(
+			"node_process_memory_vms_bytes",          // 指标名称
+			"进程使用的虚拟内存大小(字节)",              // 指标描述
+			[]string{"process_name", "exe_path"}, nil,
+		),
+		processThreadsDesc: prometheus.NewDesc(
+			"node_process_threads",                   // 指标名称
+			"进程中的线程总数",                         // 指标描述
+			[]string{"process_name", "exe_path"}, nil,
+		),
+		processIOReadDesc: prometheus.NewDesc(
+			"node_process_io_read_bytes_per_second",  // 指标名称
+			"进程每秒从磁盘读取的数据量(字节/秒)",         // 指标描述
+			[]string{"process_name", "exe_path"}, nil,
+		),
+		processIOWriteDesc: prometheus.NewDesc(
+			"node_process_io_write_bytes_per_second", // 指标名称
+			"进程每秒向磁盘写入的数据量(字节/秒)",         // 指标描述
 			[]string{"process_name", "exe_path"}, nil,
 		),
 	}
@@ -92,6 +141,14 @@ func NewSimplePortProcessCollector() *SimplePortProcessCollector {
 func (c *SimplePortProcessCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.portTCPAliveDesc
 	ch <- c.processAliveDesc
+	ch <- c.processStatusDesc
+	ch <- c.processCPUPercentDesc
+	ch <- c.processMemPercentDesc
+	ch <- c.processVMRSSDesc
+	ch <- c.processVMSizeDesc
+	ch <- c.processThreadsDesc
+	ch <- c.processIOReadDesc
+	ch <- c.processIOWriteDesc
 }
 
 // TCP检测异步化，避免阻塞指标暴露
@@ -215,6 +272,7 @@ func startProcessDetectionWorker() {
 func init() {
 	startTCPDetectionWorker()
 	startProcessDetectionWorker()
+	startProcessStatusDetectionWorker()
 }
 
 // 优雅关闭所有异步工作器
@@ -224,6 +282,7 @@ func ShutdownWorkers() {
 	shutdownOnce.Do(func() {
 		close(tcpDetectionQueue.done)
 		close(processDetectionQueue.done)
+		close(processStatusDetectionQueue.done)
 	})
 }
 
@@ -297,6 +356,67 @@ var processAliveCache = &processAliveCacheStruct{
 	Status:    make(map[string]int),
 }
 
+// 进程启动时间缓存，避免重复计算
+var pidStartTimeCache = struct {
+	sync.RWMutex
+	cache map[int]string
+}{cache: make(map[int]string)}
+
+// 进程状态缓存，避免重复读取stat文件
+var processStatusCache = struct {
+	sync.RWMutex
+	cache map[int]ProcessStatus
+	lastCheck map[int]time.Time
+}{cache: make(map[int]ProcessStatus), lastCheck: make(map[int]time.Time)}
+
+// 进程详细状态缓存（CPU、内存、IO等）
+type ProcessDetailedStatus struct {
+	CPUPercent     float64 `json:"cpu_percent"`
+	MinFaultsPerS  float64 `json:"minflt_per_s"`
+	MajFaultsPerS  float64 `json:"majflt_per_s"`
+	VMRSS          float64 `json:"vmrss"`
+	VMSize         float64 `json:"vmsize"`
+	MemPercent     float64 `json:"mem_percent"`
+	KBReadPerS     float64 `json:"kb_rd_per_s"`
+	KBWritePerS    float64 `json:"kb_wr_per_s"`
+	Threads        float64 `json:"threads"`
+	Voluntary      float64 `json:"voluntary"`
+	NonVoluntary   float64 `json:"nonvoluntary"`
+	LastUpdate     time.Time `json:"last_update"`
+	// 添加CPU累计时间字段用于正确计算CPU使用率
+	LastUtime      float64 `json:"last_utime"`
+	LastStime      float64 `json:"last_stime"`
+	LastMinflt     float64 `json:"last_minflt"`
+	LastMajflt     float64 `json:"last_majflt"`
+	LastReadBytes  float64 `json:"last_read_bytes"`
+	LastWriteBytes float64 `json:"last_write_bytes"`
+}
+
+// 进程详细状态缓存
+var processDetailedStatusCache = struct {
+	sync.RWMutex
+	cache map[int]*ProcessDetailedStatus
+	lastCheck map[int]time.Time
+}{cache: make(map[int]*ProcessDetailedStatus), lastCheck: make(map[int]time.Time)}
+
+// 进程状态采集队列
+var processStatusDetectionQueue = struct {
+	sync.Mutex
+	pids map[int]bool
+	done chan struct{}
+}{pids: make(map[int]bool), done: make(chan struct{})}
+
+// 进程状态采集间隔
+var processStatusInterval = func() time.Duration {
+	if v := os.Getenv("PROCESS_STATUS_INTERVAL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err == nil {
+			return d
+		}
+	}
+	return 30 * time.Second
+}()
+
 // Collect 方法：实现 Prometheus Collector 接口，采集所有指标
 func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 	infos := getPortProcessInfo()
@@ -323,12 +443,67 @@ func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 		// 进程存活指标去重：每个唯一进程（进程名+路径）只采集一次
 		processKey := info.ProcessName + "|" + info.ExePath
 		if !reportedProcessKeys[processKey] {
-			procAlive := getProcessAliveStatus(info.Pid)
-			if procAlive >= 0 {
+			// 获取进程详细状态（包含存活状态）
+			procStatus := getDetailedProcessStatus(info.Pid)
+
+			// 使用详细状态中的存活信息，避免重复检测
+			if procStatus.Alive >= 0 {
 				ch <- prometheus.MustNewConstMetric(
-					c.processAliveDesc, prometheus.GaugeValue, float64(procAlive),
+					c.processAliveDesc, prometheus.GaugeValue, float64(procStatus.Alive),
 					info.ProcessName, info.ExePath,
 				)
+
+				// 添加详细的进程状态指标
+				ch <- prometheus.MustNewConstMetric(
+					c.processStatusDesc, prometheus.GaugeValue, float64(procStatus.Alive),
+					info.ProcessName, info.ExePath, procStatus.State,
+				)
+
+				// 获取进程详细状态数据（CPU、内存、IO等）
+				detailedStatus := getProcessDetailedStatusCached(info.Pid)
+				if detailedStatus != nil {
+					// CPU使用率
+					ch <- prometheus.MustNewConstMetric(
+						c.processCPUPercentDesc, prometheus.GaugeValue, detailedStatus.CPUPercent,
+						info.ProcessName, info.ExePath,
+					)
+
+					// 内存使用率
+					ch <- prometheus.MustNewConstMetric(
+						c.processMemPercentDesc, prometheus.GaugeValue, detailedStatus.MemPercent,
+						info.ProcessName, info.ExePath,
+					)
+
+					// 物理内存（RSS）- 从KB转换为字节
+					ch <- prometheus.MustNewConstMetric(
+						c.processVMRSSDesc, prometheus.GaugeValue, detailedStatus.VMRSS*1024,
+						info.ProcessName, info.ExePath,
+					)
+
+					// 虚拟内存（VMSize）- 从KB转换为字节
+					ch <- prometheus.MustNewConstMetric(
+						c.processVMSizeDesc, prometheus.GaugeValue, detailedStatus.VMSize*1024,
+						info.ProcessName, info.ExePath,
+					)
+
+					// 线程数
+					ch <- prometheus.MustNewConstMetric(
+						c.processThreadsDesc, prometheus.GaugeValue, detailedStatus.Threads,
+						info.ProcessName, info.ExePath,
+					)
+
+					// IO读取速率 - 从KB/秒转换为字节/秒
+					ch <- prometheus.MustNewConstMetric(
+						c.processIOReadDesc, prometheus.GaugeValue, detailedStatus.KBReadPerS*1024,
+						info.ProcessName, info.ExePath,
+					)
+
+					// IO写入速率 - 从KB/秒转换为字节/秒
+					ch <- prometheus.MustNewConstMetric(
+						c.processIOWriteDesc, prometheus.GaugeValue, detailedStatus.KBWritePerS*1024,
+						info.ProcessName, info.ExePath,
+					)
+				}
 			}
 			reportedProcessKeys[processKey] = true
 		}
@@ -567,12 +742,26 @@ func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTi
 	}
 }
 
-// checkProcess 函数：检测进程是否存活
+// checkProcess 函数：检测进程是否存活（检查实际进程状态）
 func checkProcess(pid int) int {
-	if _, err := os.Stat(procPath(fmt.Sprintf("/proc/%d", pid))); err == nil {
-		return 1
+	statPath := procPath(fmt.Sprintf("/proc/%d/stat", pid))
+	content, err := os.ReadFile(statPath)
+	if err != nil {
+		return 0 // 进程不存在
 	}
-	return 0
+
+	fields := strings.Fields(string(content))
+	if len(fields) < 3 {
+		return 0
+	}
+
+	// 检查进程状态：Z表示僵尸进程，视为死亡
+	state := fields[2]
+	if state == "Z" {
+		return 0 // 僵尸进程视为死亡
+	}
+
+	return 1 // 进程存活
 }
 
 // getProcessExe 函数：获取进程的可执行文件路径
@@ -703,8 +892,14 @@ func cleanStalePortCaches(infos []PortProcessInfo) {
 		activePidKeys[getPidKey(info.Pid)] = true
 	}
 
-	// 清理异步检测队列中的过期端口和进程
-	// 使用固定的锁顺序避免死锁：队列锁 -> 缓存锁
+	// 原子性清理：先清理队列，再清理缓存
+	cleanDetectionQueues(activePorts, activePidKeys)
+	cleanStatusCaches(activePorts, activePidKeys)
+}
+
+// 清理检测队列中的过期项目
+func cleanDetectionQueues(activePorts map[int]bool, activePidKeys map[string]bool) {
+	// 清理TCP检测队列
 	tcpDetectionQueue.Lock()
 	for port := range tcpDetectionQueue.ports {
 		if !activePorts[port] {
@@ -713,31 +908,30 @@ func cleanStalePortCaches(infos []PortProcessInfo) {
 	}
 	tcpDetectionQueue.Unlock()
 
-	// 复制当前队列中的 PID，锁外计算 key，避免持锁执行 I/O
+	// 清理进程检测队列
 	processDetectionQueue.Lock()
-	queuedPids := make([]int, 0, len(processDetectionQueue.pids))
 	for pid := range processDetectionQueue.pids {
-		queuedPids = append(queuedPids, pid)
-	}
-	processDetectionQueue.Unlock()
-
-	// 锁外计算需要删除的 PID
-	pidsToRemove := make([]int, 0)
-	for _, pid := range queuedPids {
-		key := fmt.Sprintf("%d_%s", pid, getProcessStartTime(pid))
+		key := getPidKey(pid)
 		if !activePidKeys[key] {
-			pidsToRemove = append(pidsToRemove, pid)
+			delete(processDetectionQueue.pids, pid)
 		}
 	}
-
-	// 重新加锁，快速删除
-	processDetectionQueue.Lock();
-	for _, pid := range pidsToRemove {
-		delete(processDetectionQueue.pids, pid)
-	}
 	processDetectionQueue.Unlock()
 
-	// 清理缓存 - 使用写锁，按固定顺序获取
+	// 清理进程状态检测队列
+	processStatusDetectionQueue.Lock()
+	for pid := range processStatusDetectionQueue.pids {
+		key := getPidKey(pid)
+		if !activePidKeys[key] {
+			delete(processStatusDetectionQueue.pids, pid)
+		}
+	}
+	processStatusDetectionQueue.Unlock()
+}
+
+// 清理状态缓存中的过期项目
+func cleanStatusCaches(activePorts map[int]bool, activePidKeys map[string]bool) {
+	// 清理端口状态缓存
 	portStatusCache.RWMutex.Lock()
 	for port := range portStatusCache.Status {
 		if !activePorts[port] {
@@ -747,6 +941,7 @@ func cleanStalePortCaches(infos []PortProcessInfo) {
 	}
 	portStatusCache.RWMutex.Unlock()
 
+	// 清理进程存活缓存
 	processAliveCache.RWMutex.Lock()
 	for key := range processAliveCache.Status {
 		if !activePidKeys[key] {
@@ -755,6 +950,46 @@ func cleanStalePortCaches(infos []PortProcessInfo) {
 		}
 	}
 	processAliveCache.RWMutex.Unlock()
+
+	// 清理进程启动时间缓存
+	pidStartTimeCache.Lock()
+	for pid := range pidStartTimeCache.cache {
+		key := fmt.Sprintf("%d_%s", pid, pidStartTimeCache.cache[pid])
+		if !activePidKeys[key] {
+			delete(pidStartTimeCache.cache, pid)
+		}
+	}
+	pidStartTimeCache.Unlock()
+
+	// 清理进程状态缓存
+	processStatusCache.Lock()
+	// 先获取pidStartTimeCache的锁，避免并发访问
+	pidStartTimeCache.RLock()
+	for pid := range processStatusCache.cache {
+		startTime := pidStartTimeCache.cache[pid]
+		key := fmt.Sprintf("%d_%s", pid, startTime)
+		if !activePidKeys[key] {
+			delete(processStatusCache.cache, pid)
+			delete(processStatusCache.lastCheck, pid)
+		}
+	}
+	pidStartTimeCache.RUnlock()
+	processStatusCache.Unlock()
+
+	// 清理进程详细状态缓存
+	processDetailedStatusCache.Lock()
+	// 先获取pidStartTimeCache的锁，避免并发访问
+	pidStartTimeCache.RLock()
+	for pid := range processDetailedStatusCache.cache {
+		startTime := pidStartTimeCache.cache[pid]
+		key := fmt.Sprintf("%d_%s", pid, startTime)
+		if !activePidKeys[key] {
+			delete(processDetailedStatusCache.cache, pid)
+			delete(processDetailedStatusCache.lastCheck, pid)
+		}
+	}
+	pidStartTimeCache.RUnlock()
+	processDetailedStatusCache.Unlock()
 }
 
 // 带缓存的进程存活检测（完全异步化，避免阻塞指标暴露）
@@ -793,10 +1028,21 @@ func getProcessAliveStatus(pid int) int {
 	return status
 }
 
-// getPidKey 生成进程缓存唯一key（pid+starttime）
+// getPidKey 生成进程缓存唯一key（pid+starttime），使用缓存避免重复计算
 func getPidKey(pid int) string {
-	start := getProcessStartTime(pid)
-	return fmt.Sprintf("%d_%s", pid, start)
+	pidStartTimeCache.RLock()
+	if startTime, exists := pidStartTimeCache.cache[pid]; exists {
+		pidStartTimeCache.RUnlock()
+		return fmt.Sprintf("%d_%s", pid, startTime)
+	}
+	pidStartTimeCache.RUnlock()
+
+	startTime := getProcessStartTime(pid)
+	pidStartTimeCache.Lock()
+	pidStartTimeCache.cache[pid] = startTime
+	pidStartTimeCache.Unlock()
+
+	return fmt.Sprintf("%d_%s", pid, startTime)
 }
 
 // getProcessStartTime 获取进程启动时间（/proc/<pid>/stat 第22字段）
@@ -811,4 +1057,341 @@ func getProcessStartTime(pid int) string {
 		return fields[21]
 	}
 	return "0"
+}
+
+// ProcessStatus 进程状态信息
+type ProcessStatus struct {
+	Alive     int    `json:"alive"`
+	State     string `json:"state"`     // R/S/D/Z/T/t/W/X/x/K
+	StartTime string `json:"starttime"`
+	Pid       int    `json:"pid"`
+}
+
+// getDetailedProcessStatus 获取进程详细状态信息（带缓存）
+func getDetailedProcessStatus(pid int) ProcessStatus {
+	processStatusCache.RLock()
+	now := time.Now()
+	if status, exists := processStatusCache.cache[pid]; exists {
+		if lastCheck, hasCheck := processStatusCache.lastCheck[pid]; hasCheck {
+			// 如果缓存未过期（5秒内），直接返回缓存结果
+			if now.Sub(lastCheck) < 5*time.Second {
+				processStatusCache.RUnlock()
+				return status
+			}
+		}
+	}
+	processStatusCache.RUnlock()
+
+	// 缓存过期或不存在，重新读取
+	statPath := procPath(fmt.Sprintf("/proc/%d/stat", pid))
+	content, err := os.ReadFile(statPath)
+	if err != nil {
+		status := ProcessStatus{Pid: pid, Alive: 0, State: "X"}
+		// 缓存失败结果，避免频繁重试
+		processStatusCache.Lock()
+		processStatusCache.cache[pid] = status
+		processStatusCache.lastCheck[pid] = now
+		processStatusCache.Unlock()
+		return status
+	}
+
+	fields := strings.Fields(string(content))
+	if len(fields) < 22 {
+		status := ProcessStatus{Pid: pid, Alive: 0, State: "X"}
+		processStatusCache.Lock()
+		processStatusCache.cache[pid] = status
+		processStatusCache.lastCheck[pid] = now
+		processStatusCache.Unlock()
+		return status
+	}
+
+	state := fields[2]
+	startTime := fields[21]
+
+	alive := 1
+	if state == "Z" {
+		alive = 0
+	}
+
+	status := ProcessStatus{
+		Pid:       pid,
+		Alive:     alive,
+		State:     state,
+		StartTime: startTime,
+	}
+
+	// 更新缓存
+	processStatusCache.Lock()
+	processStatusCache.cache[pid] = status
+	processStatusCache.lastCheck[pid] = now
+	processStatusCache.Unlock()
+
+	return status
+}
+
+// 进程状态检测异步处理器
+func startProcessStatusDetectionWorker() {
+	go func() {
+		ticker := time.NewTicker(processStatusInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-processStatusDetectionQueue.done:
+				return
+			case <-ticker.C:
+				processStatusDetectionQueue.Lock()
+				pids := make([]int, 0, len(processStatusDetectionQueue.pids))
+				for pid := range processStatusDetectionQueue.pids {
+					pids = append(pids, pid)
+				}
+				// 清空队列
+				processStatusDetectionQueue.pids = make(map[int]bool)
+				processStatusDetectionQueue.Unlock()
+
+				// 异步检测所有排队的进程状态
+				var wg sync.WaitGroup
+				for _, pid := range pids {
+					wg.Add(1)
+					go func(p int) {
+						defer wg.Done()
+						defer func() {
+							if r := recover(); r != nil {
+								log.Printf("[simple_port_process_collector] 进程状态检测panic恢复: pid=%d, error=%v", p, r)
+							}
+						}()
+
+						status := getProcessDetailedStatusData(p)
+						if status != nil {
+							processDetailedStatusCache.Lock()
+							processDetailedStatusCache.cache[p] = status
+							processDetailedStatusCache.lastCheck[p] = time.Now()
+							processDetailedStatusCache.Unlock()
+						}
+
+					}(pid)
+				}
+				wg.Wait()
+			}
+		}
+	}()
+}
+
+// 获取进程详细状态数据（CPU、内存、IO等）
+func getProcessDetailedStatusData(pid int) *ProcessDetailedStatus {
+	now := time.Now()
+
+	// 获取基础状态信息
+	statusData, err := getProcessStatusData(pid)
+	if err != nil {
+		log.Printf("[simple_port_process_collector] 获取进程状态失败: pid=%d, error=%v", pid, err)
+		return nil
+	}
+
+	// 获取CPU和缺页信息
+	utime, stime, minflt, majflt, err := getProcessCPUAndFaults(pid)
+	if err != nil {
+		log.Printf("[simple_port_process_collector] 获取进程CPU信息失败: pid=%d, error=%v", pid, err)
+		return nil
+	}
+
+	// 获取IO数据
+	readBytes, writeBytes, err := getProcessIOStats(pid)
+	if err != nil {
+		log.Printf("[simple_port_process_collector] 获取进程IO信息失败: pid=%d, error=%v", pid, err)
+		return nil
+	}
+
+	// 获取内存总量
+	memTotal, _ := getSystemMemTotal()
+	if memTotal == 0 {
+		memTotal = 1 // 防止除零
+	}
+
+	// 计算增量值
+	processDetailedStatusCache.RLock()
+	cache, exists := processDetailedStatusCache.cache[pid]
+	processDetailedStatusCache.RUnlock()
+
+	var cpuPercent, minFaultsPerS, majFaultsPerS, kbReadPerS, kbWritePerS float64
+
+	if exists && cache != nil {
+		timeDiff := now.Sub(cache.LastUpdate).Seconds()
+		if timeDiff > 0 {
+			// CPU使用率计算：基于累计CPU时间差值（utime/stime单位是jiffies，需要转换为秒）
+			totalCPUDiff := (utime - cache.LastUtime) + (stime - cache.LastStime)
+			cpuPercent = (totalCPUDiff / 100) / timeDiff // 转换为秒，然后计算百分比
+
+			// 缺页错误速率计算
+			minFaultsPerS = (minflt - cache.LastMinflt) / timeDiff
+			majFaultsPerS = (majflt - cache.LastMajflt) / timeDiff
+
+			// IO速率计算
+			kbReadPerS = (readBytes - cache.LastReadBytes) / 1024 / timeDiff
+			kbWritePerS = (writeBytes - cache.LastWriteBytes) / 1024 / timeDiff
+		}
+	}
+
+	// 静态指标
+	vmrss := parseProcessStatusValue(statusData["vmrss"])
+	vmsize := parseProcessStatusValue(statusData["vmsize"])
+	threads := parseProcessStatusValue(statusData["threads"])
+	voluntary := parseProcessStatusValue(statusData["voluntary_ctxt_switches"])
+	nonvoluntary := parseProcessStatusValue(statusData["nonvoluntary_ctxt_switches"])
+	memPercent := vmrss / memTotal * 100
+
+	return &ProcessDetailedStatus{
+		CPUPercent:     cpuPercent,
+		MinFaultsPerS:  minFaultsPerS,
+		MajFaultsPerS:  majFaultsPerS,
+		VMRSS:          vmrss,
+		VMSize:         vmsize,
+		MemPercent:     memPercent,
+		KBReadPerS:     kbReadPerS,
+		KBWritePerS:    kbWritePerS,
+		Threads:        threads,
+		Voluntary:      voluntary,
+		NonVoluntary:   nonvoluntary,
+		LastUpdate:     now,
+		// 保存累计时间用于下次计算
+		LastUtime:      utime,
+		LastStime:      stime,
+		LastMinflt:     minflt,
+		LastMajflt:     majflt,
+		LastReadBytes:  readBytes,
+		LastWriteBytes: writeBytes,
+	}
+}
+
+// 从/proc/[pid]/status获取状态信息
+func getProcessStatusData(pid int) (map[string]string, error) {
+	statusFile := procPath(fmt.Sprintf("/proc/%d/status", pid))
+	file, err := os.Open(statusFile)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	data := make(map[string]string)
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) < 2 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(parts[0]))
+		value := strings.TrimSpace(parts[1])
+		data[key] = value
+	}
+	return data, scanner.Err()
+}
+
+// 从/proc/[pid]/stat获取CPU和缺页信息
+func getProcessCPUAndFaults(pid int) (float64, float64, float64, float64, error) {
+	content, err := os.ReadFile(procPath(fmt.Sprintf("/proc/%d/stat", pid)))
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+
+	fields := strings.Fields(string(content))
+	if len(fields) < 24 {
+		return 0, 0, 0, 0, fmt.Errorf("invalid stat format")
+	}
+
+	utime, _ := strconv.ParseFloat(fields[13], 64)
+	stime, _ := strconv.ParseFloat(fields[14], 64)
+	minflt, _ := strconv.ParseFloat(fields[9], 64)
+	majflt, _ := strconv.ParseFloat(fields[11], 64)
+
+	// 返回原始值，不除以100，在CPU计算时再处理
+	return utime, stime, minflt, majflt, nil
+}
+
+// 从/proc/[pid]/io获取IO数据
+func getProcessIOStats(pid int) (float64, float64, error) {
+	content, err := os.ReadFile(procPath(fmt.Sprintf("/proc/%d/io", pid)))
+	if err != nil {
+		return 0, 0, err
+	}
+
+	var readBytes, writeBytes float64
+	scanner := bufio.NewScanner(strings.NewReader(string(content)))
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "read_bytes:") {
+			fmt.Sscanf(line, "read_bytes: %f", &readBytes)
+		}
+		if strings.HasPrefix(line, "write_bytes:") {
+			fmt.Sscanf(line, "write_bytes: %f", &writeBytes)
+		}
+	}
+	return readBytes, writeBytes, nil
+}
+
+// 获取系统内存总量
+func getSystemMemTotal() (float64, error) {
+	content, err := os.ReadFile(procPath("/proc/meminfo"))
+	if err != nil {
+		return 0, err
+	}
+
+	scanner := bufio.NewScanner(strings.NewReader(string(content)))
+	for scanner.Scan() {
+		if strings.HasPrefix(scanner.Text(), "MemTotal:") {
+			fields := strings.Fields(scanner.Text())
+			if len(fields) >= 2 {
+				return strconv.ParseFloat(fields[1], 64)
+			}
+		}
+	}
+	return 0, fmt.Errorf("MemTotal not found")
+}
+
+// 辅助函数：转换状态值，支持带单位（如 '25592 kB'）
+func parseProcessStatusValue(value string) float64 {
+	if value == "" {
+		return 0
+	}
+	// 只取第一个数字部分
+	fields := strings.Fields(value)
+	f, err := strconv.ParseFloat(fields[0], 64)
+	if err != nil {
+		return 0
+	}
+	return f
+}
+
+// 带缓存的进程详细状态检测（完全异步化，避免阻塞指标暴露）
+func getProcessDetailedStatusCached(pid int) *ProcessDetailedStatus {
+	processDetailedStatusCache.RLock()
+	now := time.Now()
+	t, ok := processDetailedStatusCache.lastCheck[pid]
+	if !ok || now.Sub(t) > processStatusInterval {
+		// 先获取历史状态，避免死锁
+		var lastStatus *ProcessDetailedStatus
+		var hasHistory bool
+		if lastStatus, hasHistory = processDetailedStatusCache.cache[pid]; hasHistory {
+			processDetailedStatusCache.RUnlock()
+
+			// 缓存过期，加入进程状态异步检测队列
+			processStatusDetectionQueue.Lock()
+			processStatusDetectionQueue.pids[pid] = true
+			processStatusDetectionQueue.Unlock()
+
+			// 使用上次检测结果作为临时值
+			return lastStatus
+		}
+		processDetailedStatusCache.RUnlock()
+
+		// 没有历史记录，加入进程状态异步检测队列
+		processStatusDetectionQueue.Lock()
+		processStatusDetectionQueue.pids[pid] = true
+		processStatusDetectionQueue.Unlock()
+
+		// 不暴露指标，等待异步检测完成
+		return nil
+	}
+	status := processDetailedStatusCache.cache[pid]
+	processDetailedStatusCache.RUnlock()
+	return status
 }
