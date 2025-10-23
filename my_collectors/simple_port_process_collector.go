@@ -1276,9 +1276,11 @@ func getProcessIdentityStatus(processName, exePath string) (int, string) {
 
 	if !exists {
 		// 未找到进程身份，尝试直接查找当前进程
+		log.Printf("[simple_port_process_collector] 进程身份不存在，查找存活进程: processName=%s, exePath=%s", processName, exePath)
 		alivePid := findAliveProcessInGroup(processName, exePath)
 		if alivePid > 0 {
 			// 找到存活进程，创建新的身份信息
+			log.Printf("[simple_port_process_collector] 创建新进程身份: pid=%d", alivePid)
 			processIdentityCache.Lock()
 			processIdentityCache.cache[key] = ProcessIdentity{
 				ProcessName: processName,
@@ -1290,6 +1292,7 @@ func getProcessIdentityStatus(processName, exePath string) (int, string) {
 			processIdentityCache.Unlock()
 			return 1, "R" // 进程存活（新发现）
 		}
+		log.Printf("[simple_port_process_collector] 未找到存活进程: processName=%s, exePath=%s", processName, exePath)
 		return -1, "X" // 未找到进程
 	}
 
@@ -1346,20 +1349,47 @@ func getProcessIdentityStatus(processName, exePath string) (int, string) {
 
 // findAliveProcessInGroup 在进程组中查找存活的进程
 func findAliveProcessInGroup(processName, exePath string) int {
-	// 获取当前活跃的进程信息
-	infos := getPortProcessInfo()
+	// 直接扫描 /proc 目录查找所有进程，不依赖端口信息
+	procDir, err := os.Open(procPath("/proc"))
+	if err != nil {
+		log.Printf("[simple_port_process_collector] 无法打开/proc目录: %v", err)
+		return 0
+	}
+	defer procDir.Close()
+
+	entries, err := procDir.Readdir(-1)
+	if err != nil {
+		log.Printf("[simple_port_process_collector] 无法读取/proc目录: %v", err)
+		return 0
+	}
+
+	log.Printf("[simple_port_process_collector] 查找进程组: processName=%s, exePath=%s", processName, exePath)
 
 	// 查找同组中的存活进程
-	for _, info := range infos {
-		if info.ProcessName == processName && info.ExePath == exePath {
-			// 直接检查进程是否存活，不依赖缓存
-			status := checkProcess(info.Pid)
-			if status == 1 {
-				return info.Pid // 找到存活的进程
-			}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+
+		// 检查进程是否存活
+		status := checkProcess(pid)
+		if status != 1 {
+			continue // 进程不存活，跳过
+		}
+
+		// 检查进程名和路径是否匹配
+		currentExePath := getProcessExe(pid)
+		if currentExePath == exePath {
+			log.Printf("[simple_port_process_collector] 找到匹配的存活进程: pid=%d, exePath=%s", pid, currentExePath)
+			return pid
 		}
 	}
 
+	log.Printf("[simple_port_process_collector] 未找到匹配的存活进程: processName=%s, exePath=%s", processName, exePath)
 	return 0 // 没有找到存活的进程
 }
 
