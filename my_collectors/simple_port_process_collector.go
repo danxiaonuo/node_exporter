@@ -11,6 +11,7 @@ import (
 	"net"      // 提供网络相关功能，用于端口检测
 	"os"       // 提供操作系统接口，用于文件操作
 	"path/filepath" // 提供路径操作功能
+	"sort"     // 提供排序功能，用于优化缓存清理算法
 	"strconv"  // 提供字符串与数字转换功能
 	"strings"  // 提供字符串操作功能
 	"sync"     // 提供同步原语，用于并发控制
@@ -378,14 +379,13 @@ func startTCPDetectionWorker() {
 				case <-time.After(30 * time.Second):
 					// 超时，记录警告但不阻塞
 					log.Printf("[port_process_collector] TCP检测超时，部分goroutine可能仍在运行")
-					// 强制取消所有未完成的goroutine
-					cancel()
+					// 注意：这里无法强制取消goroutine，因为context没有传递到goroutine中
 					// 等待一小段时间让goroutine有机会退出
 					select {
 					case <-done:
 						// goroutine已经完成
 					case <-time.After(5 * time.Second):
-						log.Printf("[port_process_collector] 强制取消后仍有goroutine未退出")
+						log.Printf("[port_process_collector] 超时后仍有goroutine未退出")
 					}
 				}
 			}
@@ -458,6 +458,53 @@ func startProcessDetectionWorker() {
 			}
 		}
 	}()
+}
+
+// startProcessPidCacheCleanWorker 进程PID缓存清理工作器
+// 该函数启动一个后台goroutine，定期清理过期的进程PID缓存
+// 专门用于清理进程重启后的旧PID缓存，防止内存泄漏
+func startProcessPidCacheCleanWorker() {
+	go func() {
+		// 创建定时器，按照配置的间隔定期清理进程缓存
+		ticker := time.NewTicker(processPidCacheCleanInterval)
+		defer ticker.Stop() // 确保定时器被正确关闭
+
+		// 无限循环处理清理任务
+		for {
+			select {
+			case <-processPidCacheCleanQueue.done:
+				// 收到关闭信号，退出工作器
+				return
+			case <-ticker.C:
+				// 定时器触发，执行缓存清理
+				// 获取当前活跃的进程信息，只清理非活跃的缓存
+				activePidKeys := getCurrentActivePidKeys()
+				cleanProcessCaches(activePidKeys)
+			}
+		}
+	}()
+}
+
+// getCurrentActivePidKeys 获取当前活跃进程的PID键
+// 该函数扫描当前系统中的活跃进程，返回它们的唯一标识键
+// 用于缓存清理时保留活跃进程的缓存，只清理已死亡进程的缓存
+func getCurrentActivePidKeys() map[string]bool {
+	activePidKeys := make(map[string]bool)
+
+	// 获取当前端口进程信息
+	infos := getPortProcessInfo()
+
+	// 遍历所有端口进程信息，收集活跃的PID键
+	for _, info := range infos {
+		// 检查进程是否仍然有效
+		if isProcessValid(info.Pid) {
+			// 获取进程的唯一标识键
+			key := getPidKey(info.Pid)
+			activePidKeys[key] = true
+		}
+	}
+
+	return activePidKeys
 }
 
 // ========== 初始化和关闭管理 ==========
@@ -1699,7 +1746,6 @@ if len(detailedStatusPidsToDelete) > 0 {
 	}
 	processDetailedStatusCache.Unlock()
 }
-}
 
 // 带缓存的进程存活检测（完全异步化，避免阻塞指标暴露）
 func getProcessAliveStatus(pid int) int {
@@ -1754,21 +1800,33 @@ func getPidKey(pid int) string {
 	return fmt.Sprintf("%d_%s", pid, startTime)
 }
 
-// 字符串缓存，避免频繁的字符串拼接
+// 字符串缓存结构体，包含缓存映射和访问时间戳
+// 用于实现基于时间戳的缓存清理策略，避免清理最近使用的缓存项
 var stringCache = struct {
 	sync.RWMutex
-	cache map[string]string
+	cache map[string]string        // 字符串缓存映射，key为原始字符串，value为缓存值
+	accessTime map[string]time.Time // 访问时间映射，key为原始字符串，value为最后访问时间
 }{
 	cache: make(map[string]string),
+	accessTime: make(map[string]time.Time),
 }
 
 // getProcessIdentityKey 生成进程身份key（基于进程名+路径）- 使用缓存
+// 该函数使用带时间戳的缓存机制，记录每次访问时间
+// 用于后续的基于时间戳的缓存清理策略
 func getProcessIdentityKey(processName, exePath string) string {
 	key := processName + "|" + exePath
 
 	stringCache.RLock()
 	if cached, exists := stringCache.cache[key]; exists {
+		// 更新访问时间戳（在持有读锁的情况下更新，避免竞态条件）
 		stringCache.RUnlock()
+		stringCache.Lock()
+		// 双重检查：确保缓存项仍然存在
+		if _, stillExists := stringCache.cache[key]; stillExists {
+			stringCache.accessTime[key] = time.Now()
+		}
+		stringCache.Unlock()
 		return cached
 	}
 	stringCache.RUnlock()
@@ -1777,10 +1835,12 @@ func getProcessIdentityKey(processName, exePath string) string {
 	stringCache.Lock()
 	// 双重检查
 	if cached, exists := stringCache.cache[key]; exists {
+		stringCache.accessTime[key] = time.Now()
 		stringCache.Unlock()
 		return cached
 	}
 	stringCache.cache[key] = key
+	stringCache.accessTime[key] = time.Now()
 	stringCache.Unlock()
 
 	return key
@@ -2101,40 +2161,72 @@ func startProcessStatusDetectionWorker() {
 	}()
 }
 
-// 内存清理工作器 - 定期清理过期的缓存数据
+// startMemoryCleanupWorker 内存清理工作器
+// 该函数启动一个后台goroutine，定期清理过期的缓存数据
+// 防止内存无限增长，提高系统稳定性
 func startMemoryCleanupWorker() {
 	go func() {
+		// 创建定时器，按照配置的间隔定期清理缓存
 		ticker := time.NewTicker(DefaultMemoryCleanupInterval)
-		defer ticker.Stop()
+		defer ticker.Stop() // 确保定时器被正确关闭
+
+		// 无限循环处理清理任务
 		for {
 			select {
 			case <-ticker.C:
+				// 定时器触发，执行缓存清理
 				cleanupExpiredCaches()
+			// 注意：这里缺少done通道处理，但内存清理工作器通常不需要优雅关闭
+			// 因为它是系统级别的清理任务，应该在程序退出时自然停止
 			}
 		}
 	}()
 }
 
-// 清理过期的缓存数据
+// cleanupExpiredCaches 清理过期的缓存数据
+// 该函数定期清理各种缓存中的过期项，防止内存无限增长
+// 包括字符串缓存、进程身份缓存、端口状态缓存和进程存活缓存
 func cleanupExpiredCaches() {
 	now := time.Now()
 
-	// 清理字符串缓存（限制大小）
+	// 清理字符串缓存（基于时间戳的清理策略）
+	// 当缓存大小超过限制时，清理最久未访问的缓存项
 	stringCache.Lock()
 	if len(stringCache.cache) > MaxStringCacheSize {
-		// 随机清理一半的缓存
-		count := 0
-		for key := range stringCache.cache {
-			if count >= StringCacheCleanupSize {
-				break
-			}
+		// 基于时间戳清理最久未访问的缓存项
+		// 收集所有缓存项及其访问时间
+		type cacheItem struct {
+			key        string        // 缓存键
+			accessTime time.Time     // 最后访问时间
+		}
+
+		var items []cacheItem
+		for key, accessTime := range stringCache.accessTime {
+			items = append(items, cacheItem{key: key, accessTime: accessTime})
+		}
+
+		// 按访问时间排序（最久未访问的在前）
+		// 使用Go标准库的sort包，时间复杂度O(n log n)
+		sort.Slice(items, func(i, j int) bool {
+			return items[i].accessTime.Before(items[j].accessTime)
+		})
+
+		// 清理最久未访问的缓存项
+		cleanupCount := StringCacheCleanupSize
+		if cleanupCount > len(items) {
+			cleanupCount = len(items)
+		}
+
+		for i := 0; i < cleanupCount; i++ {
+			key := items[i].key
 			delete(stringCache.cache, key)
-			count++
+			delete(stringCache.accessTime, key)
 		}
 	}
 	stringCache.Unlock()
 
 	// 清理进程身份缓存中的过期项
+	// 清理超过指定时间未见的进程身份，防止缓存无限增长
 	processIdentityCache.Lock()
 	for key, identity := range processIdentityCache.cache {
 		// 清理超过指定时间未见的进程身份
@@ -2145,6 +2237,7 @@ func cleanupExpiredCaches() {
 	processIdentityCache.Unlock()
 
 	// 清理端口状态缓存中的过期项
+	// 清理超过指定时间未检查的端口状态，释放内存空间
 	portStatusCache.RWMutex.Lock()
 	for port, lastCheck := range portStatusCache.LastCheck {
 		// 清理超过指定时间未检查的端口状态
@@ -2156,6 +2249,7 @@ func cleanupExpiredCaches() {
 	portStatusCache.RWMutex.Unlock()
 
 	// 清理进程存活缓存中的过期项
+	// 清理超过指定时间未检查的进程状态，防止缓存泄漏
 	processAliveCache.RWMutex.Lock()
 	for key, lastCheck := range processAliveCache.LastCheck {
 		// 清理超过指定时间未检查的进程状态
