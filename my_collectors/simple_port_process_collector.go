@@ -208,7 +208,21 @@ func startTCPDetectionWorker() {
 
 					}(port)
 				}
-				wg.Wait()
+
+				// 使用带超时的等待，避免goroutine泄漏的同时防止阻塞
+				done := make(chan struct{})
+				go func() {
+					wg.Wait()
+					close(done)
+				}()
+
+				select {
+				case <-done:
+					// 所有goroutine正常完成
+				case <-time.After(30 * time.Second):
+					// 超时，记录警告但不阻塞
+					log.Printf("[port_process_collector] TCP检测超时，部分goroutine可能仍在运行")
+				}
 			}
 		}
 	}()
