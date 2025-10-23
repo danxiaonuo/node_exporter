@@ -629,24 +629,29 @@ func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 
 // getPortProcessInfo 函数：获取端口与进程信息，带缓存机制
 func getPortProcessInfo() []PortProcessInfo {
+	// 第一次判断是否过期（读锁）
 	portProcessCache.RWMutex.RLock()
 	expired := time.Since(portProcessCache.LastScan) > scanInterval || len(portProcessCache.Data) == 0
 	portProcessCache.RWMutex.RUnlock()
 	if expired {
+		// 锁外执行重扫描，避免在写锁内做重IO
+		scanned := discoverPortProcess()
+		now := time.Now()
 		var needClean bool
 		var dataCopy []PortProcessInfo
+
+		// 二次检查并提交（写锁）
 		portProcessCache.RWMutex.Lock()
-		// 再次检查，防止并发下重复扫描
 		if time.Since(portProcessCache.LastScan) > scanInterval || len(portProcessCache.Data) == 0 {
-			portProcessCache.Data = discoverPortProcess()
-			portProcessCache.LastScan = time.Now()
-			// 复制一份用于锁外清理，避免长时间持有写锁
-			dataCopy = append([]PortProcessInfo(nil), portProcessCache.Data...)
+			portProcessCache.Data = scanned
+			portProcessCache.LastScan = now
+			dataCopy = append([]PortProcessInfo(nil), scanned...)
 			needClean = true
 		}
 		portProcessCache.RWMutex.Unlock()
+
 		if needClean {
-			// 自动清理所有端口相关缓存（锁外执行，避免长时间持有写锁）
+			// 锁外清理，缩短锁持有时间
 			cleanStalePortCaches(dataCopy)
 		}
 	}
@@ -1023,7 +1028,7 @@ func cleanStalePortCaches(infos []PortProcessInfo) {
 
 // 清理检测队列中的过期项目
 func cleanDetectionQueues(activePorts map[int]bool, activePidKeys map[string]bool) {
-	// 清理TCP检测队列
+	// 清理TCP检测队列（锁内仅做内存操作）
 	tcpDetectionQueue.Lock()
 	for port := range tcpDetectionQueue.ports {
 		if !activePorts[port] {
@@ -1032,26 +1037,53 @@ func cleanDetectionQueues(activePorts map[int]bool, activePidKeys map[string]boo
 	}
 	tcpDetectionQueue.Unlock()
 
-	// 清理进程检测队列
+	// 进程检测队列：先快照后计算，再回写删除，避免锁内IO
 	processDetectionQueue.Lock()
+	pidSnapshot := make([]int, 0, len(processDetectionQueue.pids))
 	for pid := range processDetectionQueue.pids {
-		key := getPidKey(pid)
-		if !activePidKeys[key] {
-			delete(processDetectionQueue.pids, pid)
-		}
+		pidSnapshot = append(pidSnapshot, pid)
 	}
 	processDetectionQueue.Unlock()
 
-	// 清理进程状态检测队列 - 增强清理逻辑
-	processStatusDetectionQueue.Lock()
-	for pid := range processStatusDetectionQueue.pids {
+	// 计算需要删除的PID（锁外，允许触发 getPidKey 的磁盘读取）
+	pidsToDelete := make([]int, 0)
+	for _, pid := range pidSnapshot {
 		key := getPidKey(pid)
-		// 双重检查：既检查活跃PID键，也检查进程是否仍然有效
-		if !activePidKeys[key] || !isProcessValid(pid) {
-			delete(processStatusDetectionQueue.pids, pid)
+		if !activePidKeys[key] {
+			pidsToDelete = append(pidsToDelete, pid)
 		}
 	}
+	// 回写删除
+	if len(pidsToDelete) > 0 {
+		processDetectionQueue.Lock()
+		for _, pid := range pidsToDelete {
+			delete(processDetectionQueue.pids, pid)
+		}
+		processDetectionQueue.Unlock()
+	}
+
+	// 进程状态检测队列：同样采用快照+锁外判断（包含 isProcessValid）
+	processStatusDetectionQueue.Lock()
+	statusPidSnapshot := make([]int, 0, len(processStatusDetectionQueue.pids))
+	for pid := range processStatusDetectionQueue.pids {
+		statusPidSnapshot = append(statusPidSnapshot, pid)
+	}
 	processStatusDetectionQueue.Unlock()
+
+	statusPidsToDelete := make([]int, 0)
+	for _, pid := range statusPidSnapshot {
+		key := getPidKey(pid)
+		if !activePidKeys[key] || !isProcessValid(pid) {
+			statusPidsToDelete = append(statusPidsToDelete, pid)
+		}
+	}
+	if len(statusPidsToDelete) > 0 {
+		processStatusDetectionQueue.Lock()
+		for _, pid := range statusPidsToDelete {
+			delete(processStatusDetectionQueue.pids, pid)
+		}
+		processStatusDetectionQueue.Unlock()
+	}
 }
 
 // 清理进程相关缓存（专门用于进程PID缓存清理）
@@ -1811,41 +1843,50 @@ func getProcessDetailedStatusCached(pid int) *ProcessDetailedStatus {
 		processDetailedStatusCache.RUnlock()
 
 		// 没有历史记录，立即同步获取数据（避免重启后指标为0）
+		// 为避免在写锁内执行重IO，先判定后锁外拉取，再回写提交
+		needFetch := false
 		processDetailedStatusCache.Lock()
-		// 再次检查，防止并发重复计算
 		if _, exists := processDetailedStatusCache.cache[pid]; !exists {
-			// 立即同步获取数据
-			status := getProcessDetailedStatusData(pid)
-			if status != nil {
-				processDetailedStatusCache.cache[pid] = status
-				processDetailedStatusCache.lastCheck[pid] = now
-			} else {
-				// 如果获取失败，创建一个默认的状态对象，避免返回nil
-				defaultStatus := &ProcessDetailedStatus{
-					CPUPercent:     0,
-					MinFaultsPerS:  0,
-					MajFaultsPerS:  0,
-					VMRSS:          0,
-					VMSize:         0,
-					MemPercent:     0,
-					KBReadPerS:     0,
-					KBWritePerS:    0,
-					Threads:        0,
-					Voluntary:      0,
-					NonVoluntary:   0,
-					LastUpdate:     now,
-					LastUtime:      0,
-					LastStime:      0,
-					LastMinflt:     0,
-					LastMajflt:     0,
-					LastReadBytes:  0,
-					LastWriteBytes: 0,
-				}
-				processDetailedStatusCache.cache[pid] = defaultStatus
-				processDetailedStatusCache.lastCheck[pid] = now
-			}
+			needFetch = true
 		}
 		processDetailedStatusCache.Unlock()
+
+		if needFetch {
+			// 锁外执行重IO
+			status := getProcessDetailedStatusData(pid)
+			processDetailedStatusCache.Lock()
+			if _, exists := processDetailedStatusCache.cache[pid]; !exists {
+				if status != nil {
+					processDetailedStatusCache.cache[pid] = status
+					processDetailedStatusCache.lastCheck[pid] = now
+				} else {
+					// 如果获取失败，创建一个默认的状态对象，避免返回nil
+					defaultStatus := &ProcessDetailedStatus{
+						CPUPercent:     0,
+						MinFaultsPerS:  0,
+						MajFaultsPerS:  0,
+						VMRSS:          0,
+						VMSize:         0,
+						MemPercent:     0,
+						KBReadPerS:     0,
+						KBWritePerS:    0,
+						Threads:        0,
+						Voluntary:      0,
+						NonVoluntary:   0,
+						LastUpdate:     now,
+						LastUtime:      0,
+						LastStime:      0,
+						LastMinflt:     0,
+						LastMajflt:     0,
+						LastReadBytes:  0,
+						LastWriteBytes: 0,
+					}
+					processDetailedStatusCache.cache[pid] = defaultStatus
+					processDetailedStatusCache.lastCheck[pid] = now
+				}
+			}
+			processDetailedStatusCache.Unlock()
+		}
 
 		// 返回刚获取的数据
 		processDetailedStatusCache.RLock()
