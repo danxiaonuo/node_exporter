@@ -564,7 +564,7 @@ func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 
 				if overallAlive >= 0 {
 					// 进程存活状态（累计）- 使用智能身份管理
-					ch <- prometheus.MustNewConstMetric(
+				ch <- prometheus.MustNewConstMetric(
 						c.processAliveDesc, prometheus.GaugeValue, float64(overallAlive),
 						info.ProcessName, info.ExePath, firstAliveState,
 					)
@@ -602,9 +602,9 @@ func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 
 					ch <- prometheus.MustNewConstMetric(
 						c.processIOWriteDesc, prometheus.GaugeValue, aggregatedStatus.TotalIOWrite*1024,
-						info.ProcessName, info.ExePath,
-					)
-				}
+					info.ProcessName, info.ExePath,
+				)
+			}
 
 				reportedGroupKeys[groupKey] = true
 			}
@@ -862,7 +862,7 @@ func checkProcess(pid int) int {
 
 	fields := strings.Fields(string(content))
 	if len(fields) < 3 {
-		return 0
+	return 0
 	}
 
 	// 检查进程状态：Z表示僵尸进程，视为死亡
@@ -1796,13 +1796,24 @@ func getProcessDetailedStatusCached(pid int) *ProcessDetailedStatus {
 		}
 		processDetailedStatusCache.RUnlock()
 
-		// 没有历史记录，加入进程状态异步检测队列
-		processStatusDetectionQueue.Lock()
-		processStatusDetectionQueue.pids[pid] = true
-		processStatusDetectionQueue.Unlock()
+		// 没有历史记录，立即同步获取数据（避免重启后指标为0）
+		processDetailedStatusCache.Lock()
+		// 再次检查，防止并发重复计算
+		if _, exists := processDetailedStatusCache.cache[pid]; !exists {
+			// 立即同步获取数据
+			status := getProcessDetailedStatusData(pid)
+			if status != nil {
+				processDetailedStatusCache.cache[pid] = status
+				processDetailedStatusCache.lastCheck[pid] = now
+			}
+		}
+		processDetailedStatusCache.Unlock()
 
-		// 不暴露指标，等待异步检测完成
-		return nil
+		// 返回刚获取的数据
+		processDetailedStatusCache.RLock()
+		status := processDetailedStatusCache.cache[pid]
+		processDetailedStatusCache.RUnlock()
+		return status
 	}
 	status := processDetailedStatusCache.cache[pid]
 	processDetailedStatusCache.RUnlock()
