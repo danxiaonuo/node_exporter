@@ -845,6 +845,13 @@ func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTi
 	}
 }
 
+// isProcessValid 检查进程是否仍然有效（快速检查）
+func isProcessValid(pid int) bool {
+	statPath := procPath(fmt.Sprintf("/proc/%d/stat", pid))
+	_, err := os.Stat(statPath)
+	return err == nil
+}
+
 // checkProcess 函数：检测进程是否存活（检查实际进程状态）
 func checkProcess(pid int) int {
 	statPath := procPath(fmt.Sprintf("/proc/%d/stat", pid))
@@ -1021,11 +1028,12 @@ func cleanDetectionQueues(activePorts map[int]bool, activePidKeys map[string]boo
 	}
 	processDetectionQueue.Unlock()
 
-	// 清理进程状态检测队列
+	// 清理进程状态检测队列 - 增强清理逻辑
 	processStatusDetectionQueue.Lock()
 	for pid := range processStatusDetectionQueue.pids {
 		key := getPidKey(pid)
-		if !activePidKeys[key] {
+		// 双重检查：既检查活跃PID键，也检查进程是否仍然有效
+		if !activePidKeys[key] || !isProcessValid(pid) {
 			delete(processStatusDetectionQueue.pids, pid)
 		}
 	}
@@ -1048,7 +1056,8 @@ func cleanProcessCaches(activePidKeys map[string]bool) {
 	pidStartTimeCache.Lock()
 	for pid := range pidStartTimeCache.cache {
 		key := fmt.Sprintf("%d_%s", pid, pidStartTimeCache.cache[pid])
-		if !activePidKeys[key] {
+		// 双重检查：既检查活跃PID键，也检查进程是否仍然有效
+		if !activePidKeys[key] || !isProcessValid(pid) {
 			delete(pidStartTimeCache.cache, pid)
 		}
 	}
@@ -1059,8 +1068,15 @@ func cleanProcessCaches(activePidKeys map[string]bool) {
 	// 先获取pidStartTimeCache的锁，避免并发访问
 	pidStartTimeCache.RLock()
 	for pid := range processStatusCache.cache {
-		startTime := pidStartTimeCache.cache[pid]
+		startTime, exists := pidStartTimeCache.cache[pid]
+		// 如果startTime不存在或进程无效，直接删除
+		if !exists || !isProcessValid(pid) {
+			delete(processStatusCache.cache, pid)
+			delete(processStatusCache.lastCheck, pid)
+			continue
+		}
 		key := fmt.Sprintf("%d_%s", pid, startTime)
+		// 检查是否在活跃PID键中
 		if !activePidKeys[key] {
 			delete(processStatusCache.cache, pid)
 			delete(processStatusCache.lastCheck, pid)
@@ -1074,8 +1090,15 @@ func cleanProcessCaches(activePidKeys map[string]bool) {
 	// 先获取pidStartTimeCache的锁，避免并发访问
 	pidStartTimeCache.RLock()
 	for pid := range processDetailedStatusCache.cache {
-		startTime := pidStartTimeCache.cache[pid]
+		startTime, exists := pidStartTimeCache.cache[pid]
+		// 如果startTime不存在或进程无效，直接删除
+		if !exists || !isProcessValid(pid) {
+			delete(processDetailedStatusCache.cache, pid)
+			delete(processDetailedStatusCache.lastCheck, pid)
+			continue
+		}
 		key := fmt.Sprintf("%d_%s", pid, startTime)
+		// 检查是否在活跃PID键中
 		if !activePidKeys[key] {
 			delete(processDetailedStatusCache.cache, pid)
 			delete(processDetailedStatusCache.lastCheck, pid)
@@ -1133,7 +1156,13 @@ func cleanStatusCaches(activePorts map[int]bool, activePidKeys map[string]bool) 
 	// 先获取pidStartTimeCache的锁，避免并发访问
 	pidStartTimeCache.RLock()
 	for pid := range processStatusCache.cache {
-		startTime := pidStartTimeCache.cache[pid]
+		startTime, exists := pidStartTimeCache.cache[pid]
+		// 如果startTime不存在，直接删除
+		if !exists {
+			delete(processStatusCache.cache, pid)
+			delete(processStatusCache.lastCheck, pid)
+			continue
+		}
 		key := fmt.Sprintf("%d_%s", pid, startTime)
 		if !activePidKeys[key] {
 			delete(processStatusCache.cache, pid)
@@ -1148,7 +1177,13 @@ func cleanStatusCaches(activePorts map[int]bool, activePidKeys map[string]bool) 
 	// 先获取pidStartTimeCache的锁，避免并发访问
 	pidStartTimeCache.RLock()
 	for pid := range processDetailedStatusCache.cache {
-		startTime := pidStartTimeCache.cache[pid]
+		startTime, exists := pidStartTimeCache.cache[pid]
+		// 如果startTime不存在，直接删除
+		if !exists {
+			delete(processDetailedStatusCache.cache, pid)
+			delete(processDetailedStatusCache.lastCheck, pid)
+			continue
+		}
 		key := fmt.Sprintf("%d_%s", pid, startTime)
 		if !activePidKeys[key] {
 			delete(processDetailedStatusCache.cache, pid)
@@ -1223,10 +1258,9 @@ func selectBestPidForIdentity(groupInfos []PortProcessInfo) int {
 		return 0
 	}
 
-	// 策略1：优先选择存活的进程
+	// 策略1：优先选择存活的进程（使用更快的checkProcess而不是getDetailedProcessStatus）
 	for _, info := range groupInfos {
-		status := getDetailedProcessStatus(info.Pid)
-		if status.Alive == 1 {
+		if checkProcess(info.Pid) == 1 {
 			return info.Pid // 找到第一个存活的进程
 		}
 	}
@@ -1502,6 +1536,16 @@ func startProcessStatusDetectionWorker() {
 								log.Printf("[simple_port_process_collector] 进程状态检测panic恢复: pid=%d, error=%v", p, r)
 							}
 						}()
+
+						// 在检测前先验证PID是否仍然有效，避免处理已死亡的进程
+						if !isProcessValid(p) {
+							// 进程已死亡，从缓存中清理
+							processDetailedStatusCache.Lock()
+							delete(processDetailedStatusCache.cache, p)
+							delete(processDetailedStatusCache.lastCheck, p)
+							processDetailedStatusCache.Unlock()
+							return
+						}
 
 						status := getProcessDetailedStatusData(p)
 						if status != nil {
