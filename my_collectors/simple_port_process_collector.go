@@ -564,7 +564,7 @@ func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 
 				if overallAlive >= 0 {
 					// 进程存活状态（累计）- 使用智能身份管理
-				ch <- prometheus.MustNewConstMetric(
+					ch <- prometheus.MustNewConstMetric(
 						c.processAliveDesc, prometheus.GaugeValue, float64(overallAlive),
 						info.ProcessName, info.ExePath, firstAliveState,
 					)
@@ -602,9 +602,9 @@ func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 
 					ch <- prometheus.MustNewConstMetric(
 						c.processIOWriteDesc, prometheus.GaugeValue, aggregatedStatus.TotalIOWrite*1024,
-					info.ProcessName, info.ExePath,
-				)
-			}
+						info.ProcessName, info.ExePath,
+					)
+				}
 
 				reportedGroupKeys[groupKey] = true
 			}
@@ -1804,6 +1804,30 @@ func getProcessDetailedStatusCached(pid int) *ProcessDetailedStatus {
 			status := getProcessDetailedStatusData(pid)
 			if status != nil {
 				processDetailedStatusCache.cache[pid] = status
+				processDetailedStatusCache.lastCheck[pid] = now
+			} else {
+				// 如果获取失败，创建一个默认的状态对象，避免返回nil
+				defaultStatus := &ProcessDetailedStatus{
+					CPUPercent:     0,
+					MinFaultsPerS:  0,
+					MajFaultsPerS:  0,
+					VMRSS:          0,
+					VMSize:         0,
+					MemPercent:     0,
+					KBReadPerS:     0,
+					KBWritePerS:    0,
+					Threads:        0,
+					Voluntary:      0,
+					NonVoluntary:   0,
+					LastUpdate:     now,
+					LastUtime:      0,
+					LastStime:      0,
+					LastMinflt:     0,
+					LastMajflt:     0,
+					LastReadBytes:  0,
+					LastWriteBytes: 0,
+				}
+				processDetailedStatusCache.cache[pid] = defaultStatus
 				processDetailedStatusCache.lastCheck[pid] = now
 			}
 		}
