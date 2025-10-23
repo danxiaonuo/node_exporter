@@ -1087,8 +1087,8 @@ func cleanProcessCaches(activePidKeys map[string]bool) {
 	processIdentityCache.Lock()
 	now := time.Now()
 	for key, identity := range processIdentityCache.cache {
-		// 清理超过5分钟未见的进程身份
-		if now.Sub(identity.LastSeen) > 5*time.Minute {
+		// 清理超过2分钟未见的进程身份（更积极的清理策略）
+		if now.Sub(identity.LastSeen) > 2*time.Minute {
 			delete(processIdentityCache.cache, key)
 		}
 	}
@@ -1275,6 +1275,21 @@ func getProcessIdentityStatus(processName, exePath string) (int, string) {
 	processIdentityCache.RUnlock()
 
 	if !exists {
+		// 未找到进程身份，尝试直接查找当前进程
+		alivePid := findAliveProcessInGroup(processName, exePath)
+		if alivePid > 0 {
+			// 找到存活进程，创建新的身份信息
+			processIdentityCache.Lock()
+			processIdentityCache.cache[key] = ProcessIdentity{
+				ProcessName: processName,
+				ExePath:     exePath,
+				CurrentPid:  alivePid,
+				LastSeen:    time.Now(),
+				IsAlive:     true,
+			}
+			processIdentityCache.Unlock()
+			return 1, "R" // 进程存活（新发现）
+		}
 		return -1, "X" // 未找到进程
 	}
 
@@ -1311,6 +1326,21 @@ func getProcessIdentityStatus(processName, exePath string) (int, string) {
 		}
 	}
 
+	// 进程已标记为死亡，但需要重新检查是否真的死亡
+	alivePid := findAliveProcessInGroup(processName, exePath)
+	if alivePid > 0 {
+		// 发现进程重新启动，更新身份信息
+		processIdentityCache.Lock()
+		if updatedIdentity, stillExists := processIdentityCache.cache[key]; stillExists {
+			updatedIdentity.CurrentPid = alivePid
+			updatedIdentity.IsAlive = true
+			updatedIdentity.LastSeen = time.Now()
+			processIdentityCache.cache[key] = updatedIdentity
+		}
+		processIdentityCache.Unlock()
+		return 1, "R" // 进程存活（重新启动）
+	}
+
 	return 0, "X" // 进程已标记为死亡
 }
 
@@ -1322,8 +1352,9 @@ func findAliveProcessInGroup(processName, exePath string) int {
 	// 查找同组中的存活进程
 	for _, info := range infos {
 		if info.ProcessName == processName && info.ExePath == exePath {
-			status := getDetailedProcessStatus(info.Pid)
-			if status.Alive == 1 {
+			// 直接检查进程是否存活，不依赖缓存
+			status := checkProcess(info.Pid)
+			if status == 1 {
 				return info.Pid // 找到存活的进程
 			}
 		}
