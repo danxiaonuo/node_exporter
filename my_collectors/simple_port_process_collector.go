@@ -386,6 +386,40 @@ type ProcessIdentity struct {
 	IsAlive     bool      `json:"is_alive"`
 }
 
+// 强制重扫节流器，避免频繁重扫导致开销过大
+var forceRescanGuard = struct {
+    sync.Mutex
+    last time.Time
+}{}
+
+// 立即强制刷新端口-进程映射与相关缓存（带最小间隔节流）
+func forceRescanPortProcess() {
+    // 节流：最小间隔 5 秒
+    forceRescanGuard.Lock()
+    if time.Since(forceRescanGuard.last) < 5*time.Second {
+        forceRescanGuard.Unlock()
+        return
+    }
+    forceRescanGuard.last = time.Now()
+    forceRescanGuard.Unlock()
+
+    // 执行重扫
+    scanned := discoverPortProcess()
+    now := time.Now()
+
+    // 原子更新缓存数据
+    portProcessCache.RWMutex.Lock()
+    portProcessCache.Data = scanned
+    portProcessCache.LastScan = now
+    portProcessCache.RWMutex.Unlock()
+
+    // 锁外清理依赖缓存
+    if len(scanned) > 0 {
+        dataCopy := append([]PortProcessInfo(nil), scanned...)
+        cleanStalePortCaches(dataCopy)
+    }
+}
+
 // 进程状态缓存，避免重复读取stat文件
 var processStatusCache = struct {
 	sync.RWMutex
@@ -1369,6 +1403,8 @@ func getProcessIdentityStatus(processName, exePath string) (int, string) {
 				IsAlive:     true,
 			}
 			processIdentityCache.Unlock()
+			// 触发端口-进程映射的强制重扫，尽快更新分组里的PID
+			forceRescanPortProcess()
 			return 1, "R" // 进程存活（新发现）
 		}
 		return -1, "X" // 未找到进程
@@ -1393,6 +1429,8 @@ func getProcessIdentityStatus(processName, exePath string) (int, string) {
 					processIdentityCache.cache[key] = updatedIdentity
 				}
 				processIdentityCache.Unlock()
+				// 强制重扫端口-进程映射，避免累计仍使用旧PID
+				forceRescanPortProcess()
 				return 1, "R" // 进程存活（使用其他PID）
 			} else {
 				// 所有进程都已死，标记为非存活
@@ -1419,6 +1457,8 @@ func getProcessIdentityStatus(processName, exePath string) (int, string) {
 			processIdentityCache.cache[key] = updatedIdentity
 		}
 		processIdentityCache.Unlock()
+		// 触发强制重扫，以便聚合指标立刻使用新PID
+		forceRescanPortProcess()
 		return 1, "R" // 进程存活（重新启动）
 	}
 
@@ -1640,25 +1680,28 @@ func getProcessDetailedStatusData(pid int) *ProcessDetailedStatus {
 	now := time.Now()
 
 	// 获取基础状态信息
-	statusData, err := getProcessStatusData(pid)
-	if err != nil {
-		log.Printf("[simple_port_process_collector] 获取进程状态失败: pid=%d, error=%v", pid, err)
-		return nil
-	}
+    statusData, err := getProcessStatusData(pid)
+    if err != nil {
+        log.Printf("[simple_port_process_collector] 获取进程状态失败: pid=%d, error=%v", pid, err)
+        // 容错：状态读取失败时继续后续计算，使用默认0值
+        statusData = make(map[string]string)
+    }
 
 	// 获取CPU和缺页信息
-	utime, stime, minflt, majflt, err := getProcessCPUAndFaults(pid)
-	if err != nil {
-		log.Printf("[simple_port_process_collector] 获取进程CPU信息失败: pid=%d, error=%v", pid, err)
-		return nil
-	}
+    utime, stime, minflt, majflt, err := getProcessCPUAndFaults(pid)
+    if err != nil {
+        log.Printf("[simple_port_process_collector] 获取进程CPU信息失败: pid=%d, error=%v", pid, err)
+        // 容错：CPU读取失败则按0处理，避免中断其余指标
+        utime, stime, minflt, majflt = 0, 0, 0, 0
+    }
 
 	// 获取IO数据
-	readBytes, writeBytes, err := getProcessIOStats(pid)
-	if err != nil {
-		log.Printf("[simple_port_process_collector] 获取进程IO信息失败: pid=%d, error=%v", pid, err)
-		return nil
-	}
+    readBytes, writeBytes, err := getProcessIOStats(pid)
+    if err != nil {
+        log.Printf("[simple_port_process_collector] 获取进程IO信息失败: pid=%d, error=%v", pid, err)
+        // 容错：很多系统对 /proc/<pid>/io 有权限限制，读不到时置0但不影响其他指标
+        readBytes, writeBytes = 0, 0
+    }
 
 	// 获取内存总量
 	memTotal, _ := getSystemMemTotal()
@@ -1690,10 +1733,26 @@ func getProcessDetailedStatusData(pid int) *ProcessDetailedStatus {
 		}
 	}
 
-	// 静态指标
-	vmrss := parseProcessStatusValue(statusData["vmrss"])
-	vmsize := parseProcessStatusValue(statusData["vmsize"])
-	threads := parseProcessStatusValue(statusData["threads"])
+    // 静态指标（优先从 /proc/[pid]/status 读取）
+    vmrss := parseProcessStatusValue(statusData["vmrss"])
+    vmsize := parseProcessStatusValue(statusData["vmsize"])
+    threads := parseProcessStatusValue(statusData["threads"])
+
+    // 兜底：若从 status 读取失败或值为 0，尝试从 /proc/[pid]/stat 计算
+    if vmrss == 0 || vmsize == 0 || threads == 0 {
+        th, rssKB, vsizeKB, err := getProcessStatFallback(pid)
+        if err == nil {
+            if threads == 0 {
+                threads = th
+            }
+            if vmrss == 0 {
+                vmrss = rssKB
+            }
+            if vmsize == 0 {
+                vmsize = vsizeKB
+            }
+        }
+    }
 	voluntary := parseProcessStatusValue(statusData["voluntary_ctxt_switches"])
 	nonvoluntary := parseProcessStatusValue(statusData["nonvoluntary_ctxt_switches"])
 	memPercent := vmrss / memTotal * 100
@@ -1719,6 +1778,41 @@ func getProcessDetailedStatusData(pid int) *ProcessDetailedStatus {
 		LastReadBytes:  readBytes,
 		LastWriteBytes: writeBytes,
 	}
+}
+
+// 从 /proc/[pid]/stat 兜底获取线程数与RSS/VSize（以KB为单位）
+func getProcessStatFallback(pid int) (float64, float64, float64, error) {
+    content, err := os.ReadFile(procPath(fmt.Sprintf("/proc/%d/stat", pid)))
+    if err != nil {
+        return 0, 0, 0, err
+    }
+    fields := strings.Fields(string(content))
+    // 需要至少到 rss 字段（1-based 24 => 0-based 23）
+    if len(fields) < 24 {
+        return 0, 0, 0, fmt.Errorf("invalid stat format")
+    }
+
+    var (
+        threadsVal float64
+        rssPages   float64
+        vsizeBytes float64
+    )
+
+    if v, err := strconv.ParseFloat(fields[19], 64); err == nil { // 1-based 20 num_threads
+        threadsVal = v
+    }
+    if v, err := strconv.ParseFloat(fields[23], 64); err == nil { // 1-based 24 rss (pages)
+        rssPages = v
+    }
+    if v, err := strconv.ParseFloat(fields[22], 64); err == nil { // 1-based 23 vsize (bytes)
+        vsizeBytes = v
+    }
+
+    pageSizeKB := float64(os.Getpagesize()) / 1024.0
+    rssKB := rssPages * pageSizeKB
+    vsizeKB := vsizeBytes / 1024.0
+
+    return threadsVal, rssKB, vsizeKB, nil
 }
 
 // 从/proc/[pid]/status获取状态信息
