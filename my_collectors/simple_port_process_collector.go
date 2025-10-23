@@ -343,6 +343,16 @@ var (
 	}()
 )
 
+// 进程CPU时钟（ticks）每秒，默认100；可通过环境变量 PROCESS_HZ 覆盖
+var ticksPerSecond = func() float64 {
+    if v := os.Getenv("PROCESS_HZ"); v != "" {
+        if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+            return f
+        }
+    }
+    return 100
+}()
+
 type portStatusCacheStruct struct {
 	LastCheck map[int]time.Time
 	Status    map[int]int
@@ -905,21 +915,43 @@ func isProcessValid(pid int) bool {
 	return err == nil
 }
 
+// getProcStatFields 安全解析 /proc/[pid]/stat，兼容 comm 字段含空格/括号
+func getProcStatFields(pid int) ([]string, error) {
+    content, err := os.ReadFile(procPath(fmt.Sprintf("/proc/%d/stat", pid)))
+    if err != nil {
+        return nil, err
+    }
+    s := strings.TrimSpace(string(content))
+    // 形如: pid (comm with spaces) state ...
+    l := strings.IndexByte(s, '(')
+    r := strings.LastIndexByte(s, ')')
+    if l == -1 || r == -1 || r < l {
+        // 回退：尽力拆分
+        return strings.Fields(s), nil
+    }
+    pre := strings.TrimSpace(s[:l])
+    comm := s[l+1 : r]
+    post := strings.TrimSpace(s[r+1:])
+
+    fields := make([]string, 0, 52)
+    if pre != "" {
+        fields = append(fields, strings.Fields(pre)...)
+    }
+    fields = append(fields, comm)
+    if post != "" {
+        fields = append(fields, strings.Fields(post)...)
+    }
+    return fields, nil
+}
+
 // checkProcess 函数：检测进程是否存活（检查实际进程状态）
 func checkProcess(pid int) int {
-	statPath := procPath(fmt.Sprintf("/proc/%d/stat", pid))
-	content, err := os.ReadFile(statPath)
-	if err != nil {
-		return 0 // 进程不存在
-	}
-
-	fields := strings.Fields(string(content))
-	if len(fields) < 3 {
-	return 0
-	}
-
-	// 检查进程状态：Z表示僵尸进程，视为死亡
-	state := fields[2]
+    fields, err := getProcStatFields(pid)
+    if err != nil || len(fields) < 3 {
+        return 0
+    }
+    // 检查进程状态：Z表示僵尸进程，视为死亡
+    state := fields[2]
 	if state == "Z" {
 		return 0 // 僵尸进程视为死亡
 	}
@@ -1510,15 +1542,10 @@ func findAliveProcessInGroup(processName, exePath string) int {
 
 // getProcessStartTime 获取进程启动时间（/proc/<pid>/stat 第22字段）
 func getProcessStartTime(pid int) string {
-	statPath := procPath(fmt.Sprintf("/proc/%d/stat", pid))
-	content, err := os.ReadFile(statPath)
-	if err != nil {
-		return "0"
-	}
-	fields := strings.Fields(string(content))
-	if len(fields) >= 22 {
-		return fields[21]
-	}
+    fields, err := getProcStatFields(pid)
+    if err == nil && len(fields) >= 22 {
+        return fields[21]
+    }
 	return "0"
 }
 
@@ -1546,9 +1573,8 @@ func getDetailedProcessStatus(pid int) ProcessStatus {
 	processStatusCache.RUnlock()
 
 	// 缓存过期或不存在，重新读取
-	statPath := procPath(fmt.Sprintf("/proc/%d/stat", pid))
-	content, err := os.ReadFile(statPath)
-	if err != nil {
+    fields, err := getProcStatFields(pid)
+    if err != nil {
 		status := ProcessStatus{Pid: pid, Alive: 0, State: "X"}
 		// 缓存失败结果，避免频繁重试
 		processStatusCache.Lock()
@@ -1557,8 +1583,6 @@ func getDetailedProcessStatus(pid int) ProcessStatus {
 		processStatusCache.Unlock()
 		return status
 	}
-
-	fields := strings.Fields(string(content))
 	if len(fields) < 22 {
 		status := ProcessStatus{Pid: pid, Alive: 0, State: "X"}
 		processStatusCache.Lock()
@@ -1719,9 +1743,10 @@ func getProcessDetailedStatusData(pid int) *ProcessDetailedStatus {
 	if exists && cache != nil {
 		timeDiff := now.Sub(cache.LastUpdate).Seconds()
 		if timeDiff > 0 {
-			// CPU使用率计算：基于累计CPU时间差值（utime/stime单位是jiffies，需要转换为秒）
-			totalCPUDiff := (utime - cache.LastUtime) + (stime - cache.LastStime)
-			cpuPercent = (totalCPUDiff / 100) / timeDiff // 转换为秒，然后计算百分比
+            // CPU使用率计算：基于累计CPU时间差值（utime/stime为ticks），换算为秒再转百分比
+            totalCPUDiff := (utime - cache.LastUtime) + (stime - cache.LastStime)
+            // 单核百分比： (ticksDiff / ticksPerSecond) / interval * 100
+            cpuPercent = (totalCPUDiff / ticksPerSecond) / timeDiff * 100
 
 			// 缺页错误速率计算
 			minFaultsPerS = (minflt - cache.LastMinflt) / timeDiff
@@ -1782,11 +1807,10 @@ func getProcessDetailedStatusData(pid int) *ProcessDetailedStatus {
 
 // 从 /proc/[pid]/stat 兜底获取线程数与RSS/VSize（以KB为单位）
 func getProcessStatFallback(pid int) (float64, float64, float64, error) {
-    content, err := os.ReadFile(procPath(fmt.Sprintf("/proc/%d/stat", pid)))
+    fields, err := getProcStatFields(pid)
     if err != nil {
         return 0, 0, 0, err
     }
-    fields := strings.Fields(string(content))
     // 需要至少到 rss 字段（1-based 24 => 0-based 23）
     if len(fields) < 24 {
         return 0, 0, 0, fmt.Errorf("invalid stat format")
@@ -1841,13 +1865,11 @@ func getProcessStatusData(pid int) (map[string]string, error) {
 
 // 从/proc/[pid]/stat获取CPU和缺页信息
 func getProcessCPUAndFaults(pid int) (float64, float64, float64, float64, error) {
-	content, err := os.ReadFile(procPath(fmt.Sprintf("/proc/%d/stat", pid)))
-	if err != nil {
-		return 0, 0, 0, 0, err
-	}
-
-	fields := strings.Fields(string(content))
-	if len(fields) < 24 {
+    fields, err := getProcStatFields(pid)
+    if err != nil {
+        return 0, 0, 0, 0, err
+    }
+    if len(fields) < 24 {
 		return 0, 0, 0, 0, fmt.Errorf("invalid stat format")
 	}
 
