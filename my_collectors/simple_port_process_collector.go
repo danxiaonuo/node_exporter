@@ -487,10 +487,11 @@ func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 	reportedGroupKeys := make(map[string]bool) // 分组累计的进程名
 	tcpPortDone := make(map[int]bool)
 
-	// 预处理：按进程名分组，避免重复计算
+	// 预处理：按进程名+exe_path分组，避免重复计算
 	processGroups := make(map[string][]PortProcessInfo)
 	for _, info := range infos {
-		processGroups[info.ProcessName] = append(processGroups[info.ProcessName], info)
+		groupKey := info.ProcessName + "|" + info.ExePath
+		processGroups[groupKey] = append(processGroups[groupKey], info)
 	}
 
 	for _, info := range infos {
@@ -510,64 +511,95 @@ func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 			}
 		}
 
-		// 所有进程都按名称进行分组累计
+		// 所有进程都按名称+exe_path进行分组累计
 		if enableProcessAggregation && shouldAggregateProcess(info.ProcessName) {
-			if !reportedGroupKeys[info.ProcessName] {
+			groupKey := info.ProcessName + "|" + info.ExePath
+			if !reportedGroupKeys[groupKey] {
 				// 使用预分组的进程列表，避免重复计算
-				groupInfos := processGroups[info.ProcessName]
+				groupInfos := processGroups[groupKey]
 				aggregatedStatus := calculateProcessGroupAggregation(info.ProcessName, groupInfos)
 
-				// 获取第一个进程的状态信息（用于存活状态和进程状态）
-				var firstProcStatus ProcessStatus
-				if len(groupInfos) > 0 {
-					firstProcStatus = getDetailedProcessStatus(groupInfos[0].Pid)
+				// 检查所有进程的存活状态，只有全部挂了才返回0
+				var anyAlive bool = false
+				var firstAliveState string = "X"
+
+				// 边界条件：如果没有进程，直接返回0
+				if len(groupInfos) == 0 {
+					anyAlive = false
+					firstAliveState = "X"
+				} else {
+					// 优化：使用map避免重复调用getDetailedProcessStatus
+					processStatusMap := make(map[int]ProcessStatus)
+					for _, procInfo := range groupInfos {
+						if _, exists := processStatusMap[procInfo.Pid]; !exists {
+							processStatusMap[procInfo.Pid] = getDetailedProcessStatus(procInfo.Pid)
+						}
+					}
+
+					for _, procInfo := range groupInfos {
+						procStatus := processStatusMap[procInfo.Pid]
+						if procStatus.Alive == 1 {
+							anyAlive = true
+							if firstAliveState == "X" {
+								firstAliveState = procStatus.State
+							}
+						}
+					}
 				}
 
-				if firstProcStatus.Alive >= 0 {
+				// 确定整体存活状态：只要有任何一个进程存活就返回1
+				var overallAlive int
+				if anyAlive {
+					overallAlive = 1 // 有进程存活
+				} else {
+					overallAlive = 0 // 所有进程都挂了
+				}
+
+				if overallAlive >= 0 {
 					// 进程存活状态（累计）
 					ch <- prometheus.MustNewConstMetric(
-						c.processAliveDesc, prometheus.GaugeValue, float64(firstProcStatus.Alive),
-						info.ProcessName, "aggregated", firstProcStatus.State,
+						c.processAliveDesc, prometheus.GaugeValue, float64(overallAlive),
+						info.ProcessName, info.ExePath, firstAliveState,
 					)
 
 					// 累计的性能指标
 					ch <- prometheus.MustNewConstMetric(
 						c.processCPUPercentDesc, prometheus.GaugeValue, aggregatedStatus.TotalCPUPercent,
-						info.ProcessName, "aggregated",
+						info.ProcessName, info.ExePath,
 					)
 
 					ch <- prometheus.MustNewConstMetric(
 						c.processMemPercentDesc, prometheus.GaugeValue, aggregatedStatus.TotalMemPercent,
-						info.ProcessName, "aggregated",
+						info.ProcessName, info.ExePath,
 					)
 
 					ch <- prometheus.MustNewConstMetric(
 						c.processVMRSSDesc, prometheus.GaugeValue, aggregatedStatus.TotalVMRSS*1024,
-						info.ProcessName, "aggregated",
+						info.ProcessName, info.ExePath,
 					)
 
 					ch <- prometheus.MustNewConstMetric(
 						c.processVMSizeDesc, prometheus.GaugeValue, aggregatedStatus.TotalVMSize*1024,
-						info.ProcessName, "aggregated",
+						info.ProcessName, info.ExePath,
 					)
 
 					ch <- prometheus.MustNewConstMetric(
 						c.processThreadsDesc, prometheus.GaugeValue, aggregatedStatus.TotalThreads,
-						info.ProcessName, "aggregated",
+						info.ProcessName, info.ExePath,
 					)
 
 					ch <- prometheus.MustNewConstMetric(
 						c.processIOReadDesc, prometheus.GaugeValue, aggregatedStatus.TotalIORead*1024,
-						info.ProcessName, "aggregated",
+						info.ProcessName, info.ExePath,
 					)
 
 					ch <- prometheus.MustNewConstMetric(
 						c.processIOWriteDesc, prometheus.GaugeValue, aggregatedStatus.TotalIOWrite*1024,
-						info.ProcessName, "aggregated",
+						info.ProcessName, info.ExePath,
 					)
 				}
 
-				reportedGroupKeys[info.ProcessName] = true
+				reportedGroupKeys[groupKey] = true
 			}
 		}
 	}
