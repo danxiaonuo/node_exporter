@@ -70,8 +70,7 @@ func procPath(path string) string {
 // SimplePortProcessCollector 结构体：实现 Prometheus Collector 接口
 type SimplePortProcessCollector struct {
 	portTCPAliveDesc      *prometheus.Desc // TCP端口存活指标描述符
-	processAliveDesc      *prometheus.Desc // 进程存活指标描述符
-	processStatusDesc     *prometheus.Desc // 进程状态指标描述符
+	processAliveDesc      *prometheus.Desc // 进程存活指标描述符（包含进程状态）
 	processCPUPercentDesc *prometheus.Desc // 进程CPU使用率指标描述符
 	processMemPercentDesc *prometheus.Desc // 进程内存使用率指标描述符
 	processVMRSSDesc      *prometheus.Desc // 进程物理内存指标描述符
@@ -91,12 +90,7 @@ func NewSimplePortProcessCollector() *SimplePortProcessCollector {
 		),
 		processAliveDesc: prometheus.NewDesc(
 			"node_process_alive",                     // 指标名称
-			"进程存活状态 (1=存活, 0=死亡)",             // 指标描述
-			[]string{"process_name", "exe_path"}, nil,
-		),
-		processStatusDesc: prometheus.NewDesc(
-			"node_process_status",                    // 指标名称
-			"进程详细状态 (1=存活, 0=死亡) 包含进程状态",  // 指标描述
+			"进程存活状态 (1=存活, 0=死亡) 包含进程状态",  // 指标描述
 			[]string{"process_name", "exe_path", "state"}, nil,
 		),
 		processCPUPercentDesc: prometheus.NewDesc(
@@ -141,7 +135,6 @@ func NewSimplePortProcessCollector() *SimplePortProcessCollector {
 func (c *SimplePortProcessCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.portTCPAliveDesc
 	ch <- c.processAliveDesc
-	ch <- c.processStatusDesc
 	ch <- c.processCPUPercentDesc
 	ch <- c.processMemPercentDesc
 	ch <- c.processVMRSSDesc
@@ -450,12 +443,6 @@ func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 			if procStatus.Alive >= 0 {
 				ch <- prometheus.MustNewConstMetric(
 					c.processAliveDesc, prometheus.GaugeValue, float64(procStatus.Alive),
-					info.ProcessName, info.ExePath,
-				)
-
-				// 添加详细的进程状态指标
-				ch <- prometheus.MustNewConstMetric(
-					c.processStatusDesc, prometheus.GaugeValue, float64(procStatus.Alive),
 					info.ProcessName, info.ExePath, procStatus.State,
 				)
 
