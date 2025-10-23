@@ -44,7 +44,7 @@ var scanInterval = func() time.Duration {
 			return d
 		}
 	}
-	return 8 * time.Hour
+	return 8 * time.Hour // 端口列表扫描保持8小时
 }()
 
 var procPrefix = func() string {
@@ -266,6 +266,7 @@ func init() {
 	startTCPDetectionWorker()
 	startProcessDetectionWorker()
 	startProcessStatusDetectionWorker()
+	startProcessPidCacheCleanWorker()
 }
 
 // 优雅关闭所有异步工作器
@@ -276,6 +277,7 @@ func ShutdownWorkers() {
 		close(tcpDetectionQueue.done)
 		close(processDetectionQueue.done)
 		close(processStatusDetectionQueue.done)
+		close(processPidCacheCleanQueue.done)
 	})
 }
 
@@ -355,6 +357,21 @@ var pidStartTimeCache = struct {
 	cache map[int]string
 }{cache: make(map[int]string)}
 
+// 进程标识缓存（基于进程名+路径，解决服务重启问题）
+var processIdentityCache = struct {
+	sync.RWMutex
+	cache map[string]ProcessIdentity // key: "processName|exePath"
+}{cache: make(map[string]ProcessIdentity)}
+
+// ProcessIdentity 进程身份信息
+type ProcessIdentity struct {
+	ProcessName string    `json:"process_name"`
+	ExePath     string    `json:"exe_path"`
+	CurrentPid  int       `json:"current_pid"`
+	LastSeen    time.Time `json:"last_seen"`
+	IsAlive     bool      `json:"is_alive"`
+}
+
 // 进程状态缓存，避免重复读取stat文件
 var processStatusCache = struct {
 	sync.RWMutex
@@ -420,6 +437,11 @@ var processStatusDetectionQueue = struct {
 	done chan struct{}
 }{pids: make(map[int]bool), done: make(chan struct{})}
 
+// 进程PID缓存清理队列
+var processPidCacheCleanQueue = struct {
+	done chan struct{}
+}{done: make(chan struct{})}
+
 // 进程状态采集间隔
 var processStatusInterval = func() time.Duration {
 	if v := os.Getenv("PROCESS_STATUS_INTERVAL"); v != "" {
@@ -429,6 +451,17 @@ var processStatusInterval = func() time.Duration {
 		}
 	}
 	return 30 * time.Second
+}()
+
+// 进程PID缓存清理间隔（专门用于清理进程重启后的旧PID缓存）
+var processPidCacheCleanInterval = func() time.Duration {
+	if v := os.Getenv("PROCESS_PID_CACHE_CLEAN_INTERVAL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err == nil {
+			return d
+		}
+	}
+	return 1 * time.Minute // 默认1分钟清理一次进程PID缓存
 }()
 
 // 是否启用进程分组累计计算（现在默认启用）
@@ -519,44 +552,18 @@ func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 				groupInfos := processGroups[groupKey]
 				aggregatedStatus := calculateProcessGroupAggregation(info.ProcessName, groupInfos)
 
-				// 检查所有进程的存活状态，只有全部挂了才返回0
-				var anyAlive bool = false
-				var firstAliveState string = "X"
-
-				// 边界条件：如果没有进程，直接返回0
-				if len(groupInfos) == 0 {
-					anyAlive = false
-					firstAliveState = "X"
-				} else {
-					// 优化：使用map避免重复调用getDetailedProcessStatus
-					processStatusMap := make(map[int]ProcessStatus)
-					for _, procInfo := range groupInfos {
-						if _, exists := processStatusMap[procInfo.Pid]; !exists {
-							processStatusMap[procInfo.Pid] = getDetailedProcessStatus(procInfo.Pid)
-						}
-					}
-
-					for _, procInfo := range groupInfos {
-						procStatus := processStatusMap[procInfo.Pid]
-						if procStatus.Alive == 1 {
-							anyAlive = true
-							if firstAliveState == "X" {
-								firstAliveState = procStatus.State
-							}
-						}
-					}
+				// 更新进程身份信息（解决服务重启问题）- 智能选择PID
+				if len(groupInfos) > 0 {
+					// 智能选择PID：优先选择存活的进程，确保身份信息准确
+					selectedPid := selectBestPidForIdentity(groupInfos)
+					updateProcessIdentity(info.ProcessName, info.ExePath, selectedPid)
 				}
 
-				// 确定整体存活状态：只要有任何一个进程存活就返回1
-				var overallAlive int
-				if anyAlive {
-					overallAlive = 1 // 有进程存活
-				} else {
-					overallAlive = 0 // 所有进程都挂了
-				}
+				// 使用智能进程身份状态检查（解决服务重启问题）
+				overallAlive, firstAliveState := getProcessIdentityStatus(info.ProcessName, info.ExePath)
 
 				if overallAlive >= 0 {
-					// 进程存活状态（累计）
+					// 进程存活状态（累计）- 使用智能身份管理
 					ch <- prometheus.MustNewConstMetric(
 						c.processAliveDesc, prometheus.GaugeValue, float64(overallAlive),
 						info.ProcessName, info.ExePath, firstAliveState,
@@ -1024,6 +1031,70 @@ func cleanDetectionQueues(activePorts map[int]bool, activePidKeys map[string]boo
 	processStatusDetectionQueue.Unlock()
 }
 
+// 清理进程相关缓存（专门用于进程PID缓存清理）
+func cleanProcessCaches(activePidKeys map[string]bool) {
+	// 清理进程存活缓存
+	processAliveCache.RWMutex.Lock()
+	for key := range processAliveCache.Status {
+		if !activePidKeys[key] {
+			delete(processAliveCache.Status, key)
+			delete(processAliveCache.LastCheck, key)
+		}
+	}
+	processAliveCache.RWMutex.Unlock()
+
+	// 清理进程启动时间缓存
+	pidStartTimeCache.Lock()
+	for pid := range pidStartTimeCache.cache {
+		key := fmt.Sprintf("%d_%s", pid, pidStartTimeCache.cache[pid])
+		if !activePidKeys[key] {
+			delete(pidStartTimeCache.cache, pid)
+		}
+	}
+	pidStartTimeCache.Unlock()
+
+	// 清理进程状态缓存
+	processStatusCache.Lock()
+	// 先获取pidStartTimeCache的锁，避免并发访问
+	pidStartTimeCache.RLock()
+	for pid := range processStatusCache.cache {
+		startTime := pidStartTimeCache.cache[pid]
+		key := fmt.Sprintf("%d_%s", pid, startTime)
+		if !activePidKeys[key] {
+			delete(processStatusCache.cache, pid)
+			delete(processStatusCache.lastCheck, pid)
+		}
+	}
+	pidStartTimeCache.RUnlock()
+	processStatusCache.Unlock()
+
+	// 清理进程详细状态缓存
+	processDetailedStatusCache.Lock()
+	// 先获取pidStartTimeCache的锁，避免并发访问
+	pidStartTimeCache.RLock()
+	for pid := range processDetailedStatusCache.cache {
+		startTime := pidStartTimeCache.cache[pid]
+		key := fmt.Sprintf("%d_%s", pid, startTime)
+		if !activePidKeys[key] {
+			delete(processDetailedStatusCache.cache, pid)
+			delete(processDetailedStatusCache.lastCheck, pid)
+		}
+	}
+	pidStartTimeCache.RUnlock()
+	processDetailedStatusCache.Unlock()
+
+	// 清理进程身份缓存（基于进程名+路径，解决服务重启问题）
+	processIdentityCache.Lock()
+	now := time.Now()
+	for key, identity := range processIdentityCache.cache {
+		// 清理超过5分钟未见的进程身份
+		if now.Sub(identity.LastSeen) > 5*time.Minute {
+			delete(processIdentityCache.cache, key)
+		}
+	}
+	processIdentityCache.Unlock()
+}
+
 // 清理状态缓存中的过期项目
 func cleanStatusCaches(activePorts map[int]bool, activePidKeys map[string]bool) {
 	// 清理端口状态缓存
@@ -1138,6 +1209,127 @@ func getPidKey(pid int) string {
 	pidStartTimeCache.Unlock()
 
 	return fmt.Sprintf("%d_%s", pid, startTime)
+}
+
+// getProcessIdentityKey 生成进程身份key（基于进程名+路径）
+func getProcessIdentityKey(processName, exePath string) string {
+	return fmt.Sprintf("%s|%s", processName, exePath)
+}
+
+// selectBestPidForIdentity 智能选择最佳PID用于身份管理
+func selectBestPidForIdentity(groupInfos []PortProcessInfo) int {
+	if len(groupInfos) == 0 {
+		return 0
+	}
+
+	// 策略1：优先选择存活的进程
+	for _, info := range groupInfos {
+		status := getDetailedProcessStatus(info.Pid)
+		if status.Alive == 1 {
+			return info.Pid // 找到第一个存活的进程
+		}
+	}
+
+	// 策略2：如果没有存活进程，选择第一个进程（可能是刚重启的）
+	return groupInfos[0].Pid
+}
+
+// updateProcessIdentity 更新进程身份信息（解决服务重启问题）
+func updateProcessIdentity(processName, exePath string, pid int) ProcessIdentity {
+	key := getProcessIdentityKey(processName, exePath)
+	now := time.Now()
+
+	processIdentityCache.RLock()
+	identity, exists := processIdentityCache.cache[key]
+	processIdentityCache.RUnlock()
+
+	if !exists {
+		// 新进程，创建身份信息
+		identity = ProcessIdentity{
+			ProcessName: processName,
+			ExePath:     exePath,
+			CurrentPid:  pid,
+			LastSeen:    now,
+			IsAlive:     true,
+		}
+	} else {
+		// 更新现有进程信息
+		identity.CurrentPid = pid
+		identity.LastSeen = now
+		identity.IsAlive = true
+	}
+
+	processIdentityCache.Lock()
+	processIdentityCache.cache[key] = identity
+	processIdentityCache.Unlock()
+
+	return identity
+}
+
+// getProcessIdentityStatus 获取进程身份状态（解决服务重启问题）
+func getProcessIdentityStatus(processName, exePath string) (int, string) {
+	key := getProcessIdentityKey(processName, exePath)
+
+	processIdentityCache.RLock()
+	identity, exists := processIdentityCache.cache[key]
+	processIdentityCache.RUnlock()
+
+	if !exists {
+		return -1, "X" // 未找到进程
+	}
+
+	// 检查进程是否仍然存活
+	if identity.IsAlive {
+		// 检查当前PID是否仍然有效
+		status := getDetailedProcessStatus(identity.CurrentPid)
+		if status.Alive == 1 {
+			return 1, status.State // 进程存活
+		} else {
+			// 当前PID已死，尝试查找同组其他存活进程
+			alivePid := findAliveProcessInGroup(processName, exePath)
+			if alivePid > 0 {
+				// 找到其他存活进程，更新身份信息
+				processIdentityCache.Lock()
+				if updatedIdentity, stillExists := processIdentityCache.cache[key]; stillExists {
+					updatedIdentity.CurrentPid = alivePid
+					updatedIdentity.IsAlive = true
+					updatedIdentity.LastSeen = time.Now()
+					processIdentityCache.cache[key] = updatedIdentity
+				}
+				processIdentityCache.Unlock()
+				return 1, "R" // 进程存活（使用其他PID）
+			} else {
+				// 所有进程都已死，标记为非存活
+				processIdentityCache.Lock()
+				if updatedIdentity, stillExists := processIdentityCache.cache[key]; stillExists {
+					updatedIdentity.IsAlive = false
+					processIdentityCache.cache[key] = updatedIdentity
+				}
+				processIdentityCache.Unlock()
+				return 0, status.State // 进程死亡
+			}
+		}
+	}
+
+	return 0, "X" // 进程已标记为死亡
+}
+
+// findAliveProcessInGroup 在进程组中查找存活的进程
+func findAliveProcessInGroup(processName, exePath string) int {
+	// 获取当前活跃的进程信息
+	infos := getPortProcessInfo()
+
+	// 查找同组中的存活进程
+	for _, info := range infos {
+		if info.ProcessName == processName && info.ExePath == exePath {
+			status := getDetailedProcessStatus(info.Pid)
+			if status.Alive == 1 {
+				return info.Pid // 找到存活的进程
+			}
+		}
+	}
+
+	return 0 // 没有找到存活的进程
 }
 
 // getProcessStartTime 获取进程启动时间（/proc/<pid>/stat 第22字段）
@@ -1266,6 +1458,32 @@ func startProcessStatusDetectionWorker() {
 					}(pid)
 				}
 				wg.Wait()
+			}
+		}
+	}()
+}
+
+// 进程PID缓存清理工作器（专门清理进程重启后的旧PID缓存）
+func startProcessPidCacheCleanWorker() {
+	go func() {
+		ticker := time.NewTicker(processPidCacheCleanInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-processPidCacheCleanQueue.done:
+				return
+			case <-ticker.C:
+				// 获取当前活跃的进程信息
+				infos := getPortProcessInfo()
+				activePidKeys := make(map[string]bool)
+
+				// 预先计算所有活跃的PidKey
+				for _, info := range infos {
+					activePidKeys[getPidKey(info.Pid)] = true
+				}
+
+				// 清理进程相关的缓存
+				cleanProcessCaches(activePidKeys)
 			}
 		}
 	}()
