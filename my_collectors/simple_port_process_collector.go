@@ -527,14 +527,6 @@ func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 		processGroups[groupKey] = append(processGroups[groupKey], info)
 	}
 
-	// 获取所有进程（包括没有端口监听的进程）用于性能指标计算
-	allProcesses := getAllProcesses()
-	allProcessGroups := make(map[string][]PortProcessInfo)
-	for _, proc := range allProcesses {
-		groupKey := proc.ProcessName + "|" + proc.ExePath
-		allProcessGroups[groupKey] = append(allProcessGroups[groupKey], proc)
-	}
-
 	for _, info := range infos {
 		// 只处理TCP协议
 		if info.Protocol == "tcp" {
@@ -552,7 +544,7 @@ func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 			}
 		}
 
-		// 所有进程都按名称+exe_path进行分组累计
+		// 只对有端口监听的进程进行分组累计
 		if enableProcessAggregation && shouldAggregateProcess(info.ProcessName) {
 			groupKey := info.ProcessName + "|" + info.ExePath
 			if !reportedGroupKeys[groupKey] {
@@ -618,151 +610,8 @@ func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 			}
 		}
 	}
-
-	// 处理所有进程的性能指标（包括没有端口监听的进程）
-	for groupKey, groupInfos := range allProcessGroups {
-		if !reportedGroupKeys[groupKey] {
-			// 计算性能指标
-			aggregatedStatus := calculateProcessGroupAggregation(groupInfos[0].ProcessName, groupInfos)
-
-			// 更新进程身份信息
-			if len(groupInfos) > 0 {
-				selectedPid := selectBestPidForIdentity(groupInfos)
-				updateProcessIdentity(groupInfos[0].ProcessName, groupInfos[0].ExePath, selectedPid)
-			}
-
-			// 获取进程状态
-			overallAlive, firstAliveState := getProcessIdentityStatus(groupInfos[0].ProcessName, groupInfos[0].ExePath)
-
-			if overallAlive >= 0 {
-				// 进程存活状态
-				ch <- prometheus.MustNewConstMetric(
-					c.processAliveDesc, prometheus.GaugeValue, float64(overallAlive),
-					groupInfos[0].ProcessName, groupInfos[0].ExePath, firstAliveState,
-				)
-
-				// 性能指标
-				ch <- prometheus.MustNewConstMetric(
-					c.processCPUPercentDesc, prometheus.GaugeValue, aggregatedStatus.TotalCPUPercent,
-					groupInfos[0].ProcessName, groupInfos[0].ExePath,
-				)
-
-				ch <- prometheus.MustNewConstMetric(
-					c.processMemPercentDesc, prometheus.GaugeValue, aggregatedStatus.TotalMemPercent,
-					groupInfos[0].ProcessName, groupInfos[0].ExePath,
-				)
-
-				ch <- prometheus.MustNewConstMetric(
-					c.processVMRSSDesc, prometheus.GaugeValue, aggregatedStatus.TotalVMRSS*1024,
-					groupInfos[0].ProcessName, groupInfos[0].ExePath,
-				)
-
-				ch <- prometheus.MustNewConstMetric(
-					c.processVMSizeDesc, prometheus.GaugeValue, aggregatedStatus.TotalVMSize*1024,
-					groupInfos[0].ProcessName, groupInfos[0].ExePath,
-				)
-
-				ch <- prometheus.MustNewConstMetric(
-					c.processThreadsDesc, prometheus.GaugeValue, aggregatedStatus.TotalThreads,
-					groupInfos[0].ProcessName, groupInfos[0].ExePath,
-				)
-
-				ch <- prometheus.MustNewConstMetric(
-					c.processIOReadDesc, prometheus.GaugeValue, aggregatedStatus.TotalIORead*1024,
-					groupInfos[0].ProcessName, groupInfos[0].ExePath,
-				)
-
-				ch <- prometheus.MustNewConstMetric(
-					c.processIOWriteDesc, prometheus.GaugeValue, aggregatedStatus.TotalIOWrite*1024,
-					groupInfos[0].ProcessName, groupInfos[0].ExePath,
-				)
-			}
-		}
-	}
 }
 
-// 所有进程缓存
-var allProcessCache = struct {
-	LastScan time.Time
-	Data     []PortProcessInfo
-	RWMutex  sync.RWMutex
-}{}
-
-// getAllProcesses 获取所有进程信息（包括没有端口监听的进程），带缓存机制
-func getAllProcesses() []PortProcessInfo {
-	allProcessCache.RWMutex.RLock()
-	expired := time.Since(allProcessCache.LastScan) > scanInterval || len(allProcessCache.Data) == 0
-	allProcessCache.RWMutex.RUnlock()
-
-	if expired {
-		allProcessCache.RWMutex.Lock()
-		// 再次检查，防止并发下重复扫描
-		if time.Since(allProcessCache.LastScan) > scanInterval || len(allProcessCache.Data) == 0 {
-			allProcessCache.Data = discoverAllProcesses()
-			allProcessCache.LastScan = time.Now()
-		}
-		allProcessCache.RWMutex.Unlock()
-	}
-
-	allProcessCache.RWMutex.RLock()
-	defer allProcessCache.RWMutex.RUnlock()
-	return allProcessCache.Data
-}
-
-// discoverAllProcesses 发现所有进程（包括没有端口监听的进程）
-func discoverAllProcesses() []PortProcessInfo {
-	var results []PortProcessInfo
-
-	procDir, err := os.Open(procPath("/proc"))
-	if err != nil {
-		log.Printf("[simple_port_process_collector] 无法打开/proc目录: %v", err)
-		return results
-	}
-	defer procDir.Close()
-
-	entries, err := procDir.Readdir(-1)
-	if err != nil {
-		log.Printf("[simple_port_process_collector] 无法读取/proc目录: %v", err)
-		return results
-	}
-
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		pid, err := strconv.Atoi(entry.Name())
-		if err != nil {
-			continue
-		}
-
-		// 检查进程是否存活
-		status := checkProcess(pid)
-		if status != 1 {
-			continue // 跳过不存活的进程
-		}
-
-		// 获取进程信息
-		exePath := getProcessExe(pid)
-		exeName := filepath.Base(exePath)
-
-		// 跳过排除的进程
-		if isExcludedProcess(exeName) {
-			continue
-		}
-
-		results = append(results, PortProcessInfo{
-			ProcessName: safeLabel(exeName),
-			ExePath:     safeLabel(exePath),
-			Port:        0, // 没有端口监听
-			Pid:         pid,
-			WorkDir:     safeLabel(getProcessCwd(pid)),
-			Username:    safeLabel(getProcessUser(pid)),
-			Protocol:    "none", // 没有协议
-		})
-	}
-
-	return results
-}
 
 // getPortProcessInfo 函数：获取端口与进程信息，带缓存机制
 func getPortProcessInfo() []PortProcessInfo {
