@@ -695,14 +695,11 @@ func getAllProcesses() []PortProcessInfo {
 	allProcessCache.RWMutex.RUnlock()
 
 	if expired {
-		var dataCopy []PortProcessInfo
 		allProcessCache.RWMutex.Lock()
 		// 再次检查，防止并发下重复扫描
 		if time.Since(allProcessCache.LastScan) > scanInterval || len(allProcessCache.Data) == 0 {
 			allProcessCache.Data = discoverAllProcesses()
 			allProcessCache.LastScan = time.Now()
-			// 复制一份用于锁外清理，避免长时间持有写锁
-			dataCopy = append([]PortProcessInfo(nil), allProcessCache.Data...)
 		}
 		allProcessCache.RWMutex.Unlock()
 	}
