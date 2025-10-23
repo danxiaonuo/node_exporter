@@ -392,6 +392,27 @@ var processDetailedStatusCache = struct {
 	lastCheck map[int]time.Time
 }{cache: make(map[int]*ProcessDetailedStatus), lastCheck: make(map[int]time.Time)}
 
+// 进程分组累计状态
+type ProcessGroupAggregatedStatus struct {
+	ProcessName    string  `json:"process_name"`
+	ProcessCount   int     `json:"process_count"`
+	TotalCPUPercent float64 `json:"total_cpu_percent"`
+	TotalMemPercent float64 `json:"total_mem_percent"`
+	TotalVMRSS     float64 `json:"total_vmrss"`
+	TotalVMSize    float64 `json:"total_vmsize"`
+	TotalThreads   float64 `json:"total_threads"`
+	TotalIORead    float64 `json:"total_io_read"`
+	TotalIOWrite   float64 `json:"total_io_write"`
+	LastUpdate     time.Time `json:"last_update"`
+}
+
+// 进程分组累计缓存
+var processGroupAggregatedCache = struct {
+	sync.RWMutex
+	cache map[string]*ProcessGroupAggregatedStatus
+	lastCheck map[string]time.Time
+}{cache: make(map[string]*ProcessGroupAggregatedStatus), lastCheck: make(map[string]time.Time)}
+
 // 进程状态采集队列
 var processStatusDetectionQueue = struct {
 	sync.Mutex
@@ -410,11 +431,67 @@ var processStatusInterval = func() time.Duration {
 	return 30 * time.Second
 }()
 
+// 是否启用进程分组累计计算（现在默认启用）
+var enableProcessAggregation = func() bool {
+	if v := os.Getenv("ENABLE_PROCESS_AGGREGATION"); v != "" {
+		enabled, err := strconv.ParseBool(v)
+		if err == nil {
+			return enabled
+		}
+	}
+	return true // 默认启用分组累计
+}()
+
+// 判断进程是否需要分组累计（现在所有进程都按名称分组）
+func shouldAggregateProcess(processName string) bool {
+	// 所有进程都按名称进行分组累计
+	return true
+}
+
+// 计算进程分组累计状态
+func calculateProcessGroupAggregation(processName string, infos []PortProcessInfo) *ProcessGroupAggregatedStatus {
+	var totalCPU, totalMem, totalVMRSS, totalVMSize, totalThreads, totalIORead, totalIOWrite float64
+	processCount := len(infos) // 直接使用传入的进程数量
+
+	for _, info := range infos {
+		// 由于infos已经是预分组的，不需要再次检查进程名
+		detailedStatus := getProcessDetailedStatusCached(info.Pid)
+		if detailedStatus != nil {
+			totalCPU += detailedStatus.CPUPercent
+			totalMem += detailedStatus.MemPercent
+			totalVMRSS += detailedStatus.VMRSS
+			totalVMSize += detailedStatus.VMSize
+			totalThreads += detailedStatus.Threads
+			totalIORead += detailedStatus.KBReadPerS
+			totalIOWrite += detailedStatus.KBWritePerS
+		}
+	}
+
+	return &ProcessGroupAggregatedStatus{
+		ProcessName:     processName,
+		ProcessCount:    processCount,
+		TotalCPUPercent: totalCPU,
+		TotalMemPercent: totalMem,
+		TotalVMRSS:      totalVMRSS,
+		TotalVMSize:     totalVMSize,
+		TotalThreads:    totalThreads,
+		TotalIORead:     totalIORead,
+		TotalIOWrite:    totalIOWrite,
+		LastUpdate:      time.Now(),
+	}
+}
+
 // Collect 方法：实现 Prometheus Collector 接口，采集所有指标
 func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 	infos := getPortProcessInfo()
-	reportedProcessKeys := make(map[string]bool)
+	reportedGroupKeys := make(map[string]bool) // 分组累计的进程名
 	tcpPortDone := make(map[int]bool)
+
+	// 预处理：按进程名分组，避免重复计算
+	processGroups := make(map[string][]PortProcessInfo)
+	for _, info := range infos {
+		processGroups[info.ProcessName] = append(processGroups[info.ProcessName], info)
+	}
 
 	for _, info := range infos {
 		// 只处理TCP协议
@@ -433,66 +510,65 @@ func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 			}
 		}
 
-		// 进程存活指标去重：每个唯一进程（进程名+路径）只采集一次
-		processKey := info.ProcessName + "|" + info.ExePath
-		if !reportedProcessKeys[processKey] {
-			// 获取进程详细状态（包含存活状态）
-			procStatus := getDetailedProcessStatus(info.Pid)
+		// 所有进程都按名称进行分组累计
+		if enableProcessAggregation && shouldAggregateProcess(info.ProcessName) {
+			if !reportedGroupKeys[info.ProcessName] {
+				// 使用预分组的进程列表，避免重复计算
+				groupInfos := processGroups[info.ProcessName]
+				aggregatedStatus := calculateProcessGroupAggregation(info.ProcessName, groupInfos)
 
-			// 使用详细状态中的存活信息，避免重复检测
-			if procStatus.Alive >= 0 {
-				ch <- prometheus.MustNewConstMetric(
-					c.processAliveDesc, prometheus.GaugeValue, float64(procStatus.Alive),
-					info.ProcessName, info.ExePath, procStatus.State,
-				)
+				// 获取第一个进程的状态信息（用于存活状态和进程状态）
+				var firstProcStatus ProcessStatus
+				if len(groupInfos) > 0 {
+					firstProcStatus = getDetailedProcessStatus(groupInfos[0].Pid)
+				}
 
-				// 获取进程详细状态数据（CPU、内存、IO等）
-				detailedStatus := getProcessDetailedStatusCached(info.Pid)
-				if detailedStatus != nil {
-					// CPU使用率
+				if firstProcStatus.Alive >= 0 {
+					// 进程存活状态（累计）
 					ch <- prometheus.MustNewConstMetric(
-						c.processCPUPercentDesc, prometheus.GaugeValue, detailedStatus.CPUPercent,
-						info.ProcessName, info.ExePath,
+						c.processAliveDesc, prometheus.GaugeValue, float64(firstProcStatus.Alive),
+						info.ProcessName, "aggregated", firstProcStatus.State,
 					)
 
-					// 内存使用率
+					// 累计的性能指标
 					ch <- prometheus.MustNewConstMetric(
-						c.processMemPercentDesc, prometheus.GaugeValue, detailedStatus.MemPercent,
-						info.ProcessName, info.ExePath,
+						c.processCPUPercentDesc, prometheus.GaugeValue, aggregatedStatus.TotalCPUPercent,
+						info.ProcessName, "aggregated",
 					)
 
-					// 物理内存（RSS）- 从KB转换为字节
 					ch <- prometheus.MustNewConstMetric(
-						c.processVMRSSDesc, prometheus.GaugeValue, detailedStatus.VMRSS*1024,
-						info.ProcessName, info.ExePath,
+						c.processMemPercentDesc, prometheus.GaugeValue, aggregatedStatus.TotalMemPercent,
+						info.ProcessName, "aggregated",
 					)
 
-					// 虚拟内存（VMSize）- 从KB转换为字节
 					ch <- prometheus.MustNewConstMetric(
-						c.processVMSizeDesc, prometheus.GaugeValue, detailedStatus.VMSize*1024,
-						info.ProcessName, info.ExePath,
+						c.processVMRSSDesc, prometheus.GaugeValue, aggregatedStatus.TotalVMRSS*1024,
+						info.ProcessName, "aggregated",
 					)
 
-					// 线程数
 					ch <- prometheus.MustNewConstMetric(
-						c.processThreadsDesc, prometheus.GaugeValue, detailedStatus.Threads,
-						info.ProcessName, info.ExePath,
+						c.processVMSizeDesc, prometheus.GaugeValue, aggregatedStatus.TotalVMSize*1024,
+						info.ProcessName, "aggregated",
 					)
 
-					// IO读取速率 - 从KB/秒转换为字节/秒
 					ch <- prometheus.MustNewConstMetric(
-						c.processIOReadDesc, prometheus.GaugeValue, detailedStatus.KBReadPerS*1024,
-						info.ProcessName, info.ExePath,
+						c.processThreadsDesc, prometheus.GaugeValue, aggregatedStatus.TotalThreads,
+						info.ProcessName, "aggregated",
 					)
 
-					// IO写入速率 - 从KB/秒转换为字节/秒
 					ch <- prometheus.MustNewConstMetric(
-						c.processIOWriteDesc, prometheus.GaugeValue, detailedStatus.KBWritePerS*1024,
-						info.ProcessName, info.ExePath,
+						c.processIOReadDesc, prometheus.GaugeValue, aggregatedStatus.TotalIORead*1024,
+						info.ProcessName, "aggregated",
+					)
+
+					ch <- prometheus.MustNewConstMetric(
+						c.processIOWriteDesc, prometheus.GaugeValue, aggregatedStatus.TotalIOWrite*1024,
+						info.ProcessName, "aggregated",
 					)
 				}
+
+				reportedGroupKeys[info.ProcessName] = true
 			}
-			reportedProcessKeys[processKey] = true
 		}
 	}
 }
