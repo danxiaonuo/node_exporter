@@ -212,15 +212,16 @@ func procPath(path string) string {
 // 该结构体包含了所有需要暴露的 Prometheus 指标描述符
 // 每个描述符定义了指标的名称、描述和标签
 type SimplePortProcessCollector struct {
-	portTCPAliveDesc      *prometheus.Desc // TCP端口存活指标描述符，监控端口是否可访问
-	processAliveDesc      *prometheus.Desc // 进程存活指标描述符，监控进程是否运行（包含进程状态）
-	processCPUPercentDesc *prometheus.Desc // 进程CPU使用率指标描述符，监控进程CPU占用百分比
-	processMemPercentDesc *prometheus.Desc // 进程内存使用率指标描述符，监控进程内存占用百分比
-	processVMRSSDesc      *prometheus.Desc // 进程物理内存指标描述符，监控进程实际使用的物理内存
-	processVMSizeDesc     *prometheus.Desc // 进程虚拟内存指标描述符，监控进程使用的虚拟内存
-	processThreadsDesc    *prometheus.Desc // 进程线程数指标描述符，监控进程中的线程数量
-	processIOReadDesc     *prometheus.Desc // 进程IO读取指标描述符，监控进程每秒读取的数据量
-	processIOWriteDesc    *prometheus.Desc // 进程IO写入指标描述符，监控进程每秒写入的数据量
+	portTCPAliveDesc        *prometheus.Desc // TCP端口存活指标描述符，监控端口是否可访问
+	portTCPResponseTimeDesc *prometheus.Desc // TCP端口响应时间指标描述符，监控端口响应时间
+	processAliveDesc        *prometheus.Desc // 进程存活指标描述符，监控进程是否运行（包含进程状态）
+	processCPUPercentDesc   *prometheus.Desc // 进程CPU使用率指标描述符，监控进程CPU占用百分比
+	processMemPercentDesc   *prometheus.Desc // 进程内存使用率指标描述符，监控进程内存占用百分比
+	processVMRSSDesc        *prometheus.Desc // 进程物理内存指标描述符，监控进程实际使用的物理内存
+	processVMSizeDesc       *prometheus.Desc // 进程虚拟内存指标描述符，监控进程使用的虚拟内存
+	processThreadsDesc      *prometheus.Desc // 进程线程数指标描述符，监控进程中的线程数量
+	processIOReadDesc       *prometheus.Desc // 进程IO读取指标描述符，监控进程每秒读取的数据量
+	processIOWriteDesc      *prometheus.Desc // 进程IO写入指标描述符，监控进程每秒写入的数据量
 }
 
 // NewSimplePortProcessCollector 构造函数：创建并返回一个新的简化端口进程采集器
@@ -232,6 +233,13 @@ func NewSimplePortProcessCollector() *SimplePortProcessCollector {
 		portTCPAliveDesc: prometheus.NewDesc(
 			"node_tcp_port_alive",                    // 指标名称：节点TCP端口存活状态
 			"TCP端口存活状态 (1=存活, 0=死亡)",           // 指标描述：TCP端口的存活状态
+			[]string{"process_name", "exe_path", "port"}, nil, // 标签：进程名、可执行文件路径、端口号
+		),
+		// TCP端口响应时间指标描述符
+		// 监控端口响应时间，单位为秒
+		portTCPResponseTimeDesc: prometheus.NewDesc(
+			"node_tcp_port_response_time_seconds",     // 指标名称：节点TCP端口响应时间
+			"TCP端口响应时间(秒)",                       // 指标描述：TCP端口的响应时间
 			[]string{"process_name", "exe_path", "port"}, nil, // 标签：进程名、可执行文件路径、端口号
 		),
 		// 进程存活指标描述符
@@ -297,8 +305,9 @@ func NewSimplePortProcessCollector() *SimplePortProcessCollector {
 // 该方法向 Prometheus 注册所有指标描述符，定义指标的元数据
 func (c *SimplePortProcessCollector) Describe(ch chan<- *prometheus.Desc) {
 	// 向 Prometheus 注册所有指标描述符
-	ch <- c.portTCPAliveDesc      // TCP端口存活指标
-	ch <- c.processAliveDesc      // 进程存活指标
+	ch <- c.portTCPAliveDesc        // TCP端口存活指标
+	ch <- c.portTCPResponseTimeDesc // TCP端口响应时间指标
+	ch <- c.processAliveDesc        // 进程存活指标
 	ch <- c.processCPUPercentDesc // 进程CPU使用率指标
 	ch <- c.processMemPercentDesc // 进程内存使用率指标
 	ch <- c.processVMRSSDesc      // 进程物理内存指标
@@ -374,17 +383,24 @@ func startTCPDetectionWorker() {
 
 						// 根据配置选择检测模式
 						var alive int
+						var respTime float64
 						if fastMode {
 							// 快速模式下使用更短的超时时间，提高检测速度
-							alive, _ = checkPortTCPWithTimeout(p, 500*time.Millisecond)
+							alive, respTime = checkPortTCPWithTimeout(p, 500*time.Millisecond)
 						} else {
 							// 标准模式使用默认超时时间
-							alive, _ = checkPortTCP(p)
+							alive, respTime = checkPortTCP(p)
 						}
 
 						// 更新端口状态缓存
 						portStatusCache.RWMutex.Lock()
 						portStatusCache.Status[p] = alive
+						// 如果端口挂了，响应时间设为0
+						if alive == 0 {
+							portStatusCache.ResponseTime[p] = 0
+						} else {
+							portStatusCache.ResponseTime[p] = respTime
+						}
 						portStatusCache.LastCheck[p] = time.Now()
 						portStatusCache.RWMutex.Unlock()
 
@@ -628,18 +644,20 @@ var ticksPerSecond = func() float64 {
 // ========== 缓存结构体定义 ==========
 
 // portStatusCacheStruct 端口状态缓存结构体
-// 用于缓存TCP端口的存活状态，避免频繁的网络检测
+// 用于缓存TCP端口的存活状态和响应时间，避免频繁的网络检测
 type portStatusCacheStruct struct {
-	LastCheck map[int]time.Time // 端口最后检测时间映射，key为端口号
-	Status    map[int]int       // 端口状态映射，key为端口号，value为状态（1=存活，0=死亡，-1=未知）
-	RWMutex   sync.RWMutex      // 读写互斥锁，保证并发安全
+	LastCheck     map[int]time.Time // 端口最后检测时间映射，key为端口号
+	Status        map[int]int       // 端口状态映射，key为端口号，value为状态（1=存活，0=死亡，-1=未知）
+	ResponseTime  map[int]float64   // 端口响应时间映射，key为端口号，value为响应时间（秒）
+	RWMutex       sync.RWMutex      // 读写互斥锁，保证并发安全
 }
 
 // portStatusCache 端口状态缓存实例
 // 全局变量，使用指针类型避免结构体复制时的性能开销
 var portStatusCache = &portStatusCacheStruct{
-	LastCheck: make(map[int]time.Time),
-	Status:    make(map[int]int),
+	LastCheck:    make(map[int]time.Time),
+	Status:       make(map[int]int),
+	ResponseTime: make(map[int]float64),
 }
 
 // processAliveCacheStruct 进程存活状态缓存结构体
@@ -927,6 +945,13 @@ func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 					ch <- prometheus.MustNewConstMetric(
 						c.portTCPAliveDesc, prometheus.GaugeValue, float64(alive), labels...,
 					)
+
+					// 生成TCP端口响应时间指标（端口挂了时响应时间为0）
+					respTime := getPortResponseTime(info.Port)
+					// 总是暴露响应时间指标，端口挂了时为0
+					ch <- prometheus.MustNewConstMetric(
+						c.portTCPResponseTimeDesc, prometheus.GaugeValue, respTime, labels...,
+					)
 				}
 				tcpPortDone[info.Port] = true
 			}
@@ -958,46 +983,67 @@ func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 						info.ProcessName, info.ExePath, firstAliveState,
 					)
 
-					// 生成累计的性能指标
+					// 生成累计的性能指标（进程挂了时设为0）
+					var cpuPercent, memPercent, vmRSS, vmSize, threads, ioRead, ioWrite float64
+					if overallAlive == 1 {
+						// 进程存活时使用实际值
+						cpuPercent = aggregatedStatus.TotalCPUPercent
+						memPercent = aggregatedStatus.TotalMemPercent
+						vmRSS = aggregatedStatus.TotalVMRSS * 1024
+						vmSize = aggregatedStatus.TotalVMSize * 1024
+						threads = aggregatedStatus.TotalThreads
+						ioRead = aggregatedStatus.TotalIORead * 1024
+						ioWrite = aggregatedStatus.TotalIOWrite * 1024
+					} else {
+						// 进程挂了时设为0
+						cpuPercent = 0
+						memPercent = 0
+						vmRSS = 0
+						vmSize = 0
+						threads = 0
+						ioRead = 0
+						ioWrite = 0
+					}
+
 					// CPU使用率指标
 					ch <- prometheus.MustNewConstMetric(
-						c.processCPUPercentDesc, prometheus.GaugeValue, aggregatedStatus.TotalCPUPercent,
+						c.processCPUPercentDesc, prometheus.GaugeValue, cpuPercent,
 						info.ProcessName, info.ExePath,
 					)
 
 					// 内存使用率指标
 					ch <- prometheus.MustNewConstMetric(
-						c.processMemPercentDesc, prometheus.GaugeValue, aggregatedStatus.TotalMemPercent,
+						c.processMemPercentDesc, prometheus.GaugeValue, memPercent,
 						info.ProcessName, info.ExePath,
 					)
 
 					// 物理内存使用量指标（转换为字节）
 					ch <- prometheus.MustNewConstMetric(
-						c.processVMRSSDesc, prometheus.GaugeValue, aggregatedStatus.TotalVMRSS*1024,
+						c.processVMRSSDesc, prometheus.GaugeValue, vmRSS,
 						info.ProcessName, info.ExePath,
 					)
 
 					// 虚拟内存使用量指标（转换为字节）
 					ch <- prometheus.MustNewConstMetric(
-						c.processVMSizeDesc, prometheus.GaugeValue, aggregatedStatus.TotalVMSize*1024,
+						c.processVMSizeDesc, prometheus.GaugeValue, vmSize,
 						info.ProcessName, info.ExePath,
 					)
 
 					// 线程数量指标
 					ch <- prometheus.MustNewConstMetric(
-						c.processThreadsDesc, prometheus.GaugeValue, aggregatedStatus.TotalThreads,
+						c.processThreadsDesc, prometheus.GaugeValue, threads,
 						info.ProcessName, info.ExePath,
 					)
 
 					// IO读取速率指标（转换为字节/秒）
 					ch <- prometheus.MustNewConstMetric(
-						c.processIOReadDesc, prometheus.GaugeValue, aggregatedStatus.TotalIORead*1024,
+						c.processIOReadDesc, prometheus.GaugeValue, ioRead,
 						info.ProcessName, info.ExePath,
 					)
 
 					// IO写入速率指标（转换为字节/秒）
 					ch <- prometheus.MustNewConstMetric(
-						c.processIOWriteDesc, prometheus.GaugeValue, aggregatedStatus.TotalIOWrite*1024,
+						c.processIOWriteDesc, prometheus.GaugeValue, ioWrite,
 						info.ProcessName, info.ExePath,
 					)
 				}
@@ -1766,9 +1812,10 @@ func recoverFromPanic(operation string, pid int) {
 		// 根据操作类型设置相应的错误状态
 		switch operation {
 		case "TCP检测":
-			// 设置端口状态为未知
+			// 设置端口状态为未知，响应时间为0
 			portStatusCache.RWMutex.Lock()
 			portStatusCache.Status[pid] = -1
+			portStatusCache.ResponseTime[pid] = 0
 			portStatusCache.LastCheck[pid] = time.Now()
 			portStatusCache.RWMutex.Unlock()
 		case "进程检测":
@@ -1779,10 +1826,31 @@ func recoverFromPanic(operation string, pid int) {
 			processAliveCache.LastCheck[key] = time.Now()
 			processAliveCache.RWMutex.Unlock()
 		case "进程状态检测":
-			// 清理进程详细状态缓存
+			// 设置进程详细状态为0（进程挂了）
 			processDetailedStatusCache.Lock()
-			delete(processDetailedStatusCache.cache, pid)
-			delete(processDetailedStatusCache.lastCheck, pid)
+			// 创建一个全0的默认状态，表示进程挂了
+			defaultStatus := &ProcessDetailedStatus{
+				CPUPercent:     0,
+				MinFaultsPerS:  0,
+				MajFaultsPerS:  0,
+				VMRSS:          0,
+				VMSize:         0,
+				MemPercent:     0,
+				KBReadPerS:     0,
+				KBWritePerS:    0,
+				Threads:        0,
+				Voluntary:      0,
+				NonVoluntary:   0,
+				LastUpdate:     time.Now(),
+				LastUtime:      0,
+				LastStime:      0,
+				LastMinflt:     0,
+				LastMajflt:     0,
+				LastReadBytes:  0,
+				LastWriteBytes: 0,
+			}
+			processDetailedStatusCache.cache[pid] = defaultStatus
+			processDetailedStatusCache.lastCheck[pid] = time.Now()
 			processDetailedStatusCache.Unlock()
 		}
 	}
@@ -1822,6 +1890,49 @@ func getPortStatus(port int) int {
 	alive := portStatusCache.Status[port]
 	portStatusCache.RWMutex.RUnlock()
 	return alive
+}
+
+// 带缓存的TCP端口响应时间检测（完全异步化，避免阻塞指标暴露）
+func getPortResponseTime(port int) float64 {
+	portStatusCache.RWMutex.RLock()
+	now := time.Now()
+	t, ok := portStatusCache.LastCheck[port]
+	if !ok || now.Sub(t) > portStatusInterval {
+		// 先获取历史响应时间，避免死锁
+		var lastRespTime float64
+		var hasHistory bool
+		if lastRespTime, hasHistory = portStatusCache.ResponseTime[port]; hasHistory {
+			portStatusCache.RWMutex.RUnlock()
+
+			// 缓存过期，加入TCP异步检测队列
+			tcpDetectionQueue.Lock()
+			tcpDetectionQueue.ports[port] = true
+			tcpDetectionQueue.Unlock()
+
+			// 使用上次检测结果作为临时值
+			return lastRespTime
+		}
+		// 没有历史记录，释放读锁
+		portStatusCache.RWMutex.RUnlock()
+
+		// 加入TCP异步检测队列
+		tcpDetectionQueue.Lock()
+		tcpDetectionQueue.ports[port] = true
+		tcpDetectionQueue.Unlock()
+
+		// 不暴露指标，等待异步检测完成
+		return -1 // 使用-1表示暂时不暴露指标
+	}
+	respTime := portStatusCache.ResponseTime[port]
+	status := portStatusCache.Status[port]
+	portStatusCache.RWMutex.RUnlock()
+
+	// 如果端口状态为死亡(0)或未知(-1)，响应时间设为0
+	if status <= 0 {
+		return 0
+	}
+
+	return respTime
 }
 
 // 自动清理所有端口相关缓存（只保留当前活跃端口）
