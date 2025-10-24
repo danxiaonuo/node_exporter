@@ -134,6 +134,32 @@ const (
 	// DefaultStringBuilderCapacity 默认字符串构建器容量
 	// 用于预分配字符串构建器容量，提高字符串拼接效率
 	DefaultStringBuilderCapacity = 64
+
+	// ========== 日志配置常量 ==========
+	// EnablePortCheckDebugLog 是否启用端口检测调试日志
+	// 通过环境变量 DEBUG_PORT_CHECK 控制，默认为 false
+	EnablePortCheckDebugLog = func() bool {
+		if v := os.Getenv("DEBUG_PORT_CHECK"); v != "" {
+			enabled, err := strconv.ParseBool(v)
+			if err == nil {
+				return enabled
+			}
+		}
+		return true // 默认不启用调试日志
+	}()
+
+	// ========== 宿主机IP检测配置 ==========
+	// EnableHostIPDetection 是否启用宿主机IP检测
+	// 通过环境变量 ENABLE_HOST_IP_DETECTION 控制，默认为 true
+	EnableHostIPDetection = func() bool {
+		if v := os.Getenv("ENABLE_HOST_IP_DETECTION"); v != "" {
+			enabled, err := strconv.ParseBool(v)
+			if err == nil {
+				return enabled
+			}
+		}
+		return true // 默认启用宿主机IP检测
+	}()
 )
 
 // ========== 可配置变量区域 ==========
@@ -1210,6 +1236,125 @@ func checkPortTCP(port int) (alive int, respTime float64) {
 	return checkPortTCPWithTimeout(port, portCheckTimeout)
 }
 
+// getHostIPs 获取宿主机IP地址列表
+// 支持多种方式获取宿主机IP，包括环境变量、网关检测、默认路由等
+func getHostIPs() []string {
+	var hostIPs []string
+
+	// 方法1：从环境变量获取（最可靠）
+	if hostIP := os.Getenv("HOST_IP"); hostIP != "" {
+		hostIPs = append(hostIPs, hostIP)
+		if EnablePortCheckDebugLog {
+			log.Printf("[simple_port_process_collector] 从环境变量 HOST_IP 获取宿主机IP: %s", hostIP)
+		}
+	}
+
+	// 方法2：从多个环境变量获取（Docker/Kubernetes常用）
+	envVars := []string{"HOST_IP_ADDRESS", "NODE_IP", "KUBERNETES_NODE_IP", "DOCKER_HOST_IP"}
+	for _, envVar := range envVars {
+		if ip := os.Getenv(envVar); ip != "" {
+			hostIPs = append(hostIPs, ip)
+			if EnablePortCheckDebugLog {
+				log.Printf("[simple_port_process_collector] 从环境变量 %s 获取宿主机IP: %s", envVar, ip)
+			}
+		}
+	}
+
+	// 方法3：通过默认网关获取宿主机IP
+	if len(hostIPs) == 0 {
+		if gatewayIP := getGatewayIP(); gatewayIP != "" {
+			hostIPs = append(hostIPs, gatewayIP)
+			if EnablePortCheckDebugLog {
+				log.Printf("[simple_port_process_collector] 通过网关获取宿主机IP: %s", gatewayIP)
+			}
+		}
+	}
+
+	// 方法4：通过Docker bridge网络获取
+	if len(hostIPs) == 0 {
+		if bridgeIP := getDockerBridgeIP(); bridgeIP != "" {
+			hostIPs = append(hostIPs, bridgeIP)
+			if EnablePortCheckDebugLog {
+				log.Printf("[simple_port_process_collector] 通过Docker bridge获取宿主机IP: %s", bridgeIP)
+			}
+		}
+	}
+
+	// 去重
+	uniqueIPs := make(map[string]bool)
+	var result []string
+	for _, ip := range hostIPs {
+		if !uniqueIPs[ip] {
+			uniqueIPs[ip] = true
+			result = append(result, ip)
+		}
+	}
+
+	return result
+}
+
+// getGatewayIP 通过默认路由获取网关IP（通常是宿主机IP）
+func getGatewayIP() string {
+	// 读取路由表
+	content, err := os.ReadFile(procPath("/proc/net/route"))
+	if err != nil {
+		return ""
+	}
+
+	lines := strings.Split(string(content), "\n")
+	for _, line := range lines[1:] { // 跳过标题行
+		fields := strings.Fields(line)
+		if len(fields) >= 3 && fields[1] == "00000000" { // 默认路由
+			// 网关IP是十六进制格式，需要转换
+			gatewayHex := fields[2]
+			if len(gatewayHex) == 8 {
+				// 转换为IP地址
+				ip := fmt.Sprintf("%d.%d.%d.%d",
+					parseHexByte(gatewayHex[6:8]),
+					parseHexByte(gatewayHex[4:6]),
+					parseHexByte(gatewayHex[2:4]),
+					parseHexByte(gatewayHex[0:2]))
+				return ip
+			}
+		}
+	}
+	return ""
+}
+
+// parseHexByte 解析十六进制字节
+func parseHexByte(hex string) int {
+	val, _ := strconv.ParseInt(hex, 16, 32)
+	return int(val)
+}
+
+// getDockerBridgeIP 获取Docker bridge网络IP
+func getDockerBridgeIP() string {
+	// 检查Docker bridge接口
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+
+	for _, iface := range ifaces {
+		// 查找Docker bridge接口
+		if strings.Contains(iface.Name, "docker") || strings.Contains(iface.Name, "br-") {
+			addrs, err := iface.Addrs()
+			if err != nil {
+				continue
+			}
+			for _, addr := range addrs {
+				if ipNet, ok := addr.(*net.IPNet); ok {
+					ip := ipNet.IP
+					if ip.To4() != nil && !ip.IsLoopback() {
+						return ip.String()
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
 // checkPortTCPWithTimeout 带超时的TCP端口检测函数
 // 该函数检测指定端口是否可访问，支持自定义超时时间
 // 使用并发检测多个IP地址，提高检测效率
@@ -1229,6 +1374,7 @@ func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTi
 	commonAddrs := []string{"127.0.0.1", "0.0.0.0", "::1", "::"}
 	minResp := -1.0
 	found := false
+	var failedAddrs []string // 记录失败的地址
 
 	// 第一步：检测常用地址，这些地址通常响应最快
 	for _, ip := range commonAddrs {
@@ -1241,6 +1387,17 @@ func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTi
 				minResp = cost
 			}
 			found = true
+			// 可选：记录成功的连接（仅在调试模式下）
+			if EnablePortCheckDebugLog {
+				log.Printf("[simple_port_process_collector] 端口 %d 在地址 %s 检测成功，响应时间: %.3f秒", port, ip, cost)
+			}
+		} else {
+			// 记录失败的地址
+			failedAddrs = append(failedAddrs, ip)
+			// 可选：记录详细的错误信息（仅在调试模式下）
+			if EnablePortCheckDebugLog {
+				log.Printf("[simple_port_process_collector] 端口 %d 在地址 %s 检测失败: %v", port, ip, err)
+			}
 		}
 	}
 
@@ -1249,8 +1406,19 @@ func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTi
 		return 1, minResp
 	}
 
-	// 常用地址都不通，再检测所有本地IP（并发）
+	// 常用地址都不通，再检测所有本地IP和宿主机IP（并发）
 	addrs := []string{}
+
+	// 获取宿主机IP（如果启用）
+	if EnableHostIPDetection {
+		hostIPs := getHostIPs()
+		addrs = append(addrs, hostIPs...)
+		if EnablePortCheckDebugLog && len(hostIPs) > 0 {
+			log.Printf("[simple_port_process_collector] 检测到宿主机IP: %v", hostIPs)
+		}
+	}
+
+	// 获取本地网络接口IP
 	ifaces, _ := net.InterfaceAddrs()
 	for _, addr := range ifaces {
 		var ip net.IP
@@ -1269,13 +1437,28 @@ func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTi
 		}
 		addrs = append(addrs, ip.String())
 	}
+
+	// 去重
+	uniqueAddrs := make(map[string]bool)
+	var finalAddrs []string
+	for _, addr := range addrs {
+		if !uniqueAddrs[addr] {
+			uniqueAddrs[addr] = true
+			finalAddrs = append(finalAddrs, addr)
+		}
+	}
+	addrs = finalAddrs
+
 	if len(addrs) == 0 {
+		// 记录所有常用地址都失败的情况
+		log.Printf("[simple_port_process_collector] 端口 %d 检测失败: 常用地址 %v 均不可达", port, failedAddrs)
 		return 0, 0
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	resultOnce := make(chan float64, 1)
+	failedOnce := make(chan string, len(addrs)) // 用于收集失败的地址
 	sem := make(chan struct{}, maxParallelIPChecks)
 	var wg sync.WaitGroup
 
@@ -1297,11 +1480,25 @@ func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTi
 				// 连接成功立即关闭
 				conn.Close()
 				cost := time.Since(start).Seconds()
+				// 可选：记录成功的连接（仅在调试模式下）
+				if EnablePortCheckDebugLog {
+					log.Printf("[simple_port_process_collector] 端口 %d 在地址 %s 检测成功，响应时间: %.3f秒", port, ip, cost)
+				}
 				select {
 				case resultOnce <- cost:
 					// 首个成功，取消其他拨号
 					cancel()
 				default:
+				}
+			} else {
+				// 记录失败的地址
+				select {
+				case failedOnce <- ip:
+				default:
+				}
+				// 可选：记录详细的错误信息（仅在调试模式下）
+				if EnablePortCheckDebugLog {
+					log.Printf("[simple_port_process_collector] 端口 %d 在地址 %s 检测失败: %v", port, ip, err)
 				}
 			}
 		}(ip)
@@ -1313,6 +1510,14 @@ func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTi
 		return 1, resp
 	case <-ctx.Done():
 		wg.Wait()
+		// 收集所有失败的地址
+		var allFailedAddrs []string
+		close(failedOnce)
+		for failedIP := range failedOnce {
+			allFailedAddrs = append(allFailedAddrs, failedIP)
+		}
+		// 记录所有地址都失败的情况
+		log.Printf("[simple_port_process_collector] 端口 %d 检测失败: 常用地址 %v 和本地IP %v 均不可达", port, failedAddrs, addrs)
 		return 0, 0
 	}
 }
