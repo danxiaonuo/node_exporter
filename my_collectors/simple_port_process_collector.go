@@ -1235,16 +1235,19 @@ func checkPortTCP(port int) (alive int, respTime float64) {
 	return checkPortTCPWithTimeout(port, portCheckTimeout)
 }
 
-// 网卡信息缓存结构体
-var networkInterfaceCache = struct {
+// ========== 宿主机IP检测相关代码 ==========
+// 这些代码专门用于容器环境中的宿主机IP检测，比环境变量检测更准确
+
+// hostIPCache 宿主机IP缓存结构体
+var hostIPCache = struct {
 	LastScan time.Time
-	Data     []NetworkInterfaceInfo
+	Data     []HostIPInfo
 	Mutex    sync.RWMutex
 }{Data: nil}
 
-// 缓存刷新周期，默认8小时，可通过环境变量 NETWORK_INTERFACE_INTERVAL 配置
-var networkInterfaceInterval = func() time.Duration {
-	if v := os.Getenv("NETWORK_INTERFACE_INTERVAL"); v != "" {
+// hostIPCacheInterval 宿主机IP缓存刷新周期，默认8小时
+var hostIPCacheInterval = func() time.Duration {
+	if v := os.Getenv("HOST_IP_CACHE_INTERVAL"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err == nil {
 			return d
@@ -1253,34 +1256,32 @@ var networkInterfaceInterval = func() time.Duration {
 	return 8 * time.Hour
 }()
 
-// 物理网卡信息结构体
-// InterfaceName: 网卡名称
-// IPAddresses: IPv4 地址列表
-type NetworkInterfaceInfo struct {
+// HostIPInfo 宿主机IP信息结构体
+type HostIPInfo struct {
 	InterfaceName string
 	IPAddresses   []string
 }
 
-// 获取物理网卡信息，带缓存，每8小时刷新一次
-func getNetworkInterfaceInfo() []NetworkInterfaceInfo {
-	networkInterfaceCache.Mutex.RLock()
-	expired := time.Since(networkInterfaceCache.LastScan) > networkInterfaceInterval || networkInterfaceCache.Data == nil
-	networkInterfaceCache.Mutex.RUnlock()
+// getHostIPInfo 获取宿主机IP信息，带缓存，每8小时刷新一次
+func getHostIPInfo() []HostIPInfo {
+	hostIPCache.Mutex.RLock()
+	expired := time.Since(hostIPCache.LastScan) > hostIPCacheInterval || hostIPCache.Data == nil
+	hostIPCache.Mutex.RUnlock()
 	if expired {
-		networkInterfaceCache.Mutex.Lock()
-		if time.Since(networkInterfaceCache.LastScan) > networkInterfaceInterval || networkInterfaceCache.Data == nil {
-			networkInterfaceCache.Data = collectNetworkInterfaceInfo()
-			networkInterfaceCache.LastScan = time.Now()
+		hostIPCache.Mutex.Lock()
+		if time.Since(hostIPCache.LastScan) > hostIPCacheInterval || hostIPCache.Data == nil {
+			hostIPCache.Data = collectHostIPInfo()
+			hostIPCache.LastScan = time.Now()
 		}
-		networkInterfaceCache.Mutex.Unlock()
+		hostIPCache.Mutex.Unlock()
 	}
-	networkInterfaceCache.Mutex.RLock()
-	defer networkInterfaceCache.Mutex.RUnlock()
-	return networkInterfaceCache.Data
+	hostIPCache.Mutex.RLock()
+	defer hostIPCache.Mutex.RUnlock()
+	return hostIPCache.Data
 }
 
-// 判断是否为虚拟网卡（如 docker、veth、br-、virbr、lo 等）
-func isVirtualInterface(name string) bool {
+// isVirtualHostInterface 判断是否为虚拟网卡（如 docker、veth、br-、virbr、lo 等）
+func isVirtualHostInterface(name string) bool {
 	virtualPrefixes := []string{"docker", "veth", "br-", "virbr", "lo", "vmnet", "tap", "tun", "wlx", "enx"}
 	for _, prefix := range virtualPrefixes {
 		if strings.HasPrefix(name, prefix) {
@@ -1290,15 +1291,15 @@ func isVirtualInterface(name string) bool {
 	return false
 }
 
-// 采集物理网卡及其 IPv4 地址
-func collectNetworkInterfaceInfo() []NetworkInterfaceInfo {
-	var result []NetworkInterfaceInfo
+// collectHostIPInfo 采集物理网卡及其 IPv4 地址
+func collectHostIPInfo() []HostIPInfo {
+	var result []HostIPInfo
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return result
 	}
 	for _, iface := range ifaces {
-		if isVirtualInterface(iface.Name) || iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
+		if isVirtualHostInterface(iface.Name) || iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
 			continue
 		}
 		addrs, err := iface.Addrs()
@@ -1318,7 +1319,7 @@ func collectNetworkInterfaceInfo() []NetworkInterfaceInfo {
 			}
 		}
 		if len(ipAddresses) > 0 {
-			result = append(result, NetworkInterfaceInfo{
+			result = append(result, HostIPInfo{
 				InterfaceName: iface.Name,
 				IPAddresses:   ipAddresses,
 			})
@@ -1328,37 +1329,16 @@ func collectNetworkInterfaceInfo() []NetworkInterfaceInfo {
 }
 
 // getHostIPs 获取宿主机IP地址列表
-// 支持环境变量和物理网卡检测两种方式
+// 只通过物理网卡检测获取宿主机IP，这是最准确的方式
 func getHostIPs() []string {
 	var hostIPs []string
 
-	// 方法1：从环境变量获取（最可靠）
-	if hostIP := os.Getenv("HOST_IP"); hostIP != "" {
-		hostIPs = append(hostIPs, hostIP)
+	// 通过物理网卡获取宿主机IP（最准确的方式）
+	hostIPInfos := getHostIPInfo()
+	for _, info := range hostIPInfos {
+		hostIPs = append(hostIPs, info.IPAddresses...)
 		if EnablePortCheckDebugLog {
-			log.Printf("[simple_port_process_collector] 从环境变量 HOST_IP 获取宿主机IP: %s", hostIP)
-		}
-	}
-
-	// 方法2：从多个环境变量获取（Docker/Kubernetes常用）
-	envVars := []string{"HOST_IP_ADDRESS", "NODE_IP", "KUBERNETES_NODE_IP", "DOCKER_HOST_IP"}
-	for _, envVar := range envVars {
-		if ip := os.Getenv(envVar); ip != "" {
-			hostIPs = append(hostIPs, ip)
-			if EnablePortCheckDebugLog {
-				log.Printf("[simple_port_process_collector] 从环境变量 %s 获取宿主机IP: %s", envVar, ip)
-			}
-		}
-	}
-
-	// 方法3：通过物理网卡获取宿主机IP
-	if len(hostIPs) == 0 {
-		networkInfos := getNetworkInterfaceInfo()
-		for _, info := range networkInfos {
-			hostIPs = append(hostIPs, info.IPAddresses...)
-			if EnablePortCheckDebugLog {
-				log.Printf("[simple_port_process_collector] 从物理网卡 %s 获取宿主机IP: %v", info.InterfaceName, info.IPAddresses)
-			}
+			log.Printf("[simple_port_process_collector] 从物理网卡 %s 获取宿主机IP: %v", info.InterfaceName, info.IPAddresses)
 		}
 	}
 
