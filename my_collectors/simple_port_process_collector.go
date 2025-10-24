@@ -135,35 +135,34 @@ const (
 	// 用于预分配字符串构建器容量，提高字符串拼接效率
 	DefaultStringBuilderCapacity = 64
 
-	// ========== 日志配置常量 ==========
-	// EnablePortCheckDebugLog 是否启用端口检测调试日志
-	// 通过环境变量 DEBUG_PORT_CHECK 控制，默认为 false
-	EnablePortCheckDebugLog = func() bool {
-		if v := os.Getenv("DEBUG_PORT_CHECK"); v != "" {
-			enabled, err := strconv.ParseBool(v)
-			if err == nil {
-				return enabled
-			}
-		}
-		return true // 默认不启用调试日志
-	}()
-
-	// ========== 宿主机IP检测配置 ==========
-	// EnableHostIPDetection 是否启用宿主机IP检测
-	// 通过环境变量 ENABLE_HOST_IP_DETECTION 控制，默认为 true
-	EnableHostIPDetection = func() bool {
-		if v := os.Getenv("ENABLE_HOST_IP_DETECTION"); v != "" {
-			enabled, err := strconv.ParseBool(v)
-			if err == nil {
-				return enabled
-			}
-		}
-		return true // 默认启用宿主机IP检测
-	}()
 )
 
 // ========== 可配置变量区域 ==========
 // 这些变量支持通过环境变量进行配置，提供运行时灵活性
+
+// EnablePortCheckDebugLog 是否启用端口检测调试日志
+// 通过环境变量 DEBUG_PORT_CHECK 控制，默认为 true
+var EnablePortCheckDebugLog = func() bool {
+	if v := os.Getenv("DEBUG_PORT_CHECK"); v != "" {
+		enabled, err := strconv.ParseBool(v)
+		if err == nil {
+			return enabled
+		}
+	}
+	return true // 默认启用调试日志
+}()
+
+// EnableHostIPDetection 是否启用宿主机IP检测
+// 通过环境变量 ENABLE_HOST_IP_DETECTION 控制，默认为 true
+var EnableHostIPDetection = func() bool {
+	if v := os.Getenv("ENABLE_HOST_IP_DETECTION"); v != "" {
+		enabled, err := strconv.ParseBool(v)
+		if err == nil {
+			return enabled
+		}
+	}
+	return true // 默认启用宿主机IP检测
+}()
 
 // scanInterval 端口进程扫描间隔配置
 // 支持通过环境变量 PORT_LABEL_INTERVAL 进行配置
