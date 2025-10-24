@@ -1235,8 +1235,100 @@ func checkPortTCP(port int) (alive int, respTime float64) {
 	return checkPortTCPWithTimeout(port, portCheckTimeout)
 }
 
+// 网卡信息缓存结构体
+var networkInterfaceCache = struct {
+	LastScan time.Time
+	Data     []NetworkInterfaceInfo
+	Mutex    sync.RWMutex
+}{Data: nil}
+
+// 缓存刷新周期，默认8小时，可通过环境变量 NETWORK_INTERFACE_INTERVAL 配置
+var networkInterfaceInterval = func() time.Duration {
+	if v := os.Getenv("NETWORK_INTERFACE_INTERVAL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err == nil {
+			return d
+		}
+	}
+	return 8 * time.Hour
+}()
+
+// 物理网卡信息结构体
+// InterfaceName: 网卡名称
+// IPAddresses: IPv4 地址列表
+type NetworkInterfaceInfo struct {
+	InterfaceName string
+	IPAddresses   []string
+}
+
+// 获取物理网卡信息，带缓存，每8小时刷新一次
+func getNetworkInterfaceInfo() []NetworkInterfaceInfo {
+	networkInterfaceCache.Mutex.RLock()
+	expired := time.Since(networkInterfaceCache.LastScan) > networkInterfaceInterval || networkInterfaceCache.Data == nil
+	networkInterfaceCache.Mutex.RUnlock()
+	if expired {
+		networkInterfaceCache.Mutex.Lock()
+		if time.Since(networkInterfaceCache.LastScan) > networkInterfaceInterval || networkInterfaceCache.Data == nil {
+			networkInterfaceCache.Data = collectNetworkInterfaceInfo()
+			networkInterfaceCache.LastScan = time.Now()
+		}
+		networkInterfaceCache.Mutex.Unlock()
+	}
+	networkInterfaceCache.Mutex.RLock()
+	defer networkInterfaceCache.Mutex.RUnlock()
+	return networkInterfaceCache.Data
+}
+
+// 判断是否为虚拟网卡（如 docker、veth、br-、virbr、lo 等）
+func isVirtualInterface(name string) bool {
+	virtualPrefixes := []string{"docker", "veth", "br-", "virbr", "lo", "vmnet", "tap", "tun", "wlx", "enx"}
+	for _, prefix := range virtualPrefixes {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// 采集物理网卡及其 IPv4 地址
+func collectNetworkInterfaceInfo() []NetworkInterfaceInfo {
+	var result []NetworkInterfaceInfo
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return result
+	}
+	for _, iface := range ifaces {
+		if isVirtualInterface(iface.Name) || iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		// 使用 map 来去重 IP 地址
+		ipSet := make(map[string]bool)
+		var ipAddresses []string
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.To4() != nil {
+				ipStr := ipnet.IP.String()
+				if !ipSet[ipStr] {
+					ipSet[ipStr] = true
+					ipAddresses = append(ipAddresses, ipStr)
+				}
+			}
+		}
+		if len(ipAddresses) > 0 {
+			result = append(result, NetworkInterfaceInfo{
+				InterfaceName: iface.Name,
+				IPAddresses:   ipAddresses,
+			})
+		}
+	}
+	return result
+}
+
 // getHostIPs 获取宿主机IP地址列表
-// 支持多种方式获取宿主机IP，包括环境变量、网关检测、默认路由等
+// 支持环境变量和物理网卡检测两种方式
 func getHostIPs() []string {
 	var hostIPs []string
 
@@ -1259,22 +1351,13 @@ func getHostIPs() []string {
 		}
 	}
 
-	// 方法3：通过默认网关获取宿主机IP
+	// 方法3：通过物理网卡获取宿主机IP
 	if len(hostIPs) == 0 {
-		if gatewayIP := getGatewayIP(); gatewayIP != "" {
-			hostIPs = append(hostIPs, gatewayIP)
+		networkInfos := getNetworkInterfaceInfo()
+		for _, info := range networkInfos {
+			hostIPs = append(hostIPs, info.IPAddresses...)
 			if EnablePortCheckDebugLog {
-				log.Printf("[simple_port_process_collector] 通过网关获取宿主机IP: %s", gatewayIP)
-			}
-		}
-	}
-
-	// 方法4：通过Docker bridge网络获取
-	if len(hostIPs) == 0 {
-		if bridgeIP := getDockerBridgeIP(); bridgeIP != "" {
-			hostIPs = append(hostIPs, bridgeIP)
-			if EnablePortCheckDebugLog {
-				log.Printf("[simple_port_process_collector] 通过Docker bridge获取宿主机IP: %s", bridgeIP)
+				log.Printf("[simple_port_process_collector] 从物理网卡 %s 获取宿主机IP: %v", info.InterfaceName, info.IPAddresses)
 			}
 		}
 	}
@@ -1290,68 +1373,6 @@ func getHostIPs() []string {
 	}
 
 	return result
-}
-
-// getGatewayIP 通过默认路由获取网关IP（通常是宿主机IP）
-func getGatewayIP() string {
-	// 读取路由表
-	content, err := os.ReadFile(procPath("/proc/net/route"))
-	if err != nil {
-		return ""
-	}
-
-	lines := strings.Split(string(content), "\n")
-	for _, line := range lines[1:] { // 跳过标题行
-		fields := strings.Fields(line)
-		if len(fields) >= 3 && fields[1] == "00000000" { // 默认路由
-			// 网关IP是十六进制格式，需要转换
-			gatewayHex := fields[2]
-			if len(gatewayHex) == 8 {
-				// 转换为IP地址
-				ip := fmt.Sprintf("%d.%d.%d.%d",
-					parseHexByte(gatewayHex[6:8]),
-					parseHexByte(gatewayHex[4:6]),
-					parseHexByte(gatewayHex[2:4]),
-					parseHexByte(gatewayHex[0:2]))
-				return ip
-			}
-		}
-	}
-	return ""
-}
-
-// parseHexByte 解析十六进制字节
-func parseHexByte(hex string) int {
-	val, _ := strconv.ParseInt(hex, 16, 32)
-	return int(val)
-}
-
-// getDockerBridgeIP 获取Docker bridge网络IP
-func getDockerBridgeIP() string {
-	// 检查Docker bridge接口
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return ""
-	}
-
-	for _, iface := range ifaces {
-		// 查找Docker bridge接口
-		if strings.Contains(iface.Name, "docker") || strings.Contains(iface.Name, "br-") {
-			addrs, err := iface.Addrs()
-			if err != nil {
-				continue
-			}
-			for _, addr := range addrs {
-				if ipNet, ok := addr.(*net.IPNet); ok {
-					ip := ipNet.IP
-					if ip.To4() != nil && !ip.IsLoopback() {
-						return ip.String()
-					}
-				}
-			}
-		}
-	}
-	return ""
 }
 
 // checkPortTCPWithTimeout 带超时的TCP端口检测函数
@@ -1511,10 +1532,17 @@ func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTi
 		wg.Wait()
 		// 收集所有失败的地址
 		var allFailedAddrs []string
-		close(failedOnce)
-		for failedIP := range failedOnce {
-			allFailedAddrs = append(allFailedAddrs, failedIP)
+		// 不关闭channel，而是通过非阻塞方式收集失败的地址
+		for {
+			select {
+			case failedIP := <-failedOnce:
+				allFailedAddrs = append(allFailedAddrs, failedIP)
+			default:
+				// 没有更多失败的地址，退出循环
+				goto logFailure
+			}
 		}
+	logFailure:
 		// 记录所有地址都失败的情况
 		log.Printf("[simple_port_process_collector] 端口 %d 检测失败: 常用地址 %v 和本地IP %v 均不可达", port, failedAddrs, addrs)
 		return 0, 0
@@ -2928,6 +2956,9 @@ func getProcessDetailedStatusCached(pid int) *ProcessDetailedStatus {
 					processDetailedStatusCache.lastCheck[pid] = now
 				}
 			}
+			processDetailedStatusCache.Unlock()
+		} else {
+			// 如果缓存已存在，释放锁
 			processDetailedStatusCache.Unlock()
 		}
 
