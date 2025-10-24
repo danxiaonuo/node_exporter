@@ -221,43 +221,6 @@ const (
 	LocalhostIPv6     = "::1"
 	AnyIPv6           = "::"
 
-	// 进程排除列表（默认）
-	DefaultExcludedProcesses = []string{
-		"systemd",
-		"init",
-		"kthreadd",
-		"ksoftirqd",
-		"rcu_sched",
-		"rcu_bh",
-		"bo-agent",
-		"migration",
-		"watchdog",
-		"cpuhp",
-		"netns",
-		"khungtaskd",
-		"oom_reaper",
-		"chronyd",
-		"kswapd",
-		"fsnotify_mark",
-		"ecryptfs-kthrea",
-		"kauditd",
-		"khubd",
-		"ssh",
-		"snmpd",
-		"zabbix",
-		"prometheus",
-		"rpcbind",
-		"smartdns",
-		"cupsd",
-		"dhclient",
-		"master",
-		"rpc.statd",
-		"titanagent",
-		"node_exporter",
-		"monitor_manage",
-		"dnsmasq",
-	}
-
 	// 字符串分隔符
 	ProcessKeySeparator   = "|"
 	PidKeySeparator       = "_"
@@ -2170,6 +2133,43 @@ func safeLabel(val string) string {
 		return DefaultLabelValue
 	}
 	return val
+}
+
+// DefaultExcludedProcesses 默认排除的进程列表
+var DefaultExcludedProcesses = []string{
+	"systemd",
+	"init",
+	"kthreadd",
+	"ksoftirqd",
+	"rcu_sched",
+	"rcu_bh",
+	"bo-agent",
+	"migration",
+	"watchdog",
+	"cpuhp",
+	"netns",
+	"khungtaskd",
+	"oom_reaper",
+	"chronyd",
+	"kswapd",
+	"fsnotify_mark",
+	"ecryptfs-kthrea",
+	"kauditd",
+	"khubd",
+	"ssh",
+	"snmpd",
+	"zabbix",
+	"prometheus",
+	"rpcbind",
+	"smartdns",
+	"cupsd",
+	"dhclient",
+	"master",
+	"rpc.statd",
+	"titanagent",
+	"node_exporter",
+	"monitor_manage",
+	"dnsmasq",
 }
 
 var excludedProcessNames = func() []string {
