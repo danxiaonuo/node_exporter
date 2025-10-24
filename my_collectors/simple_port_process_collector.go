@@ -45,6 +45,9 @@ type portProcessCacheStruct struct {
 // 使用指针类型，避免结构体复制时的性能开销
 var portProcessCache = &portProcessCacheStruct{}
 
+// 全局goroutine管理器
+var goroutineManager = NewSafeGoroutineManager()
+
 // 常量定义区域
 // 所有常量都使用有意义的名称，避免魔法数字，提高代码可读性和可维护性
 const (
@@ -55,15 +58,15 @@ const (
 
 	// DefaultPortStatusInterval 默认端口状态检测间隔
 	// 端口状态变化较快，使用较短的检测间隔保证监控的实时性
-	DefaultPortStatusInterval = 30 * time.Second
+	DefaultPortStatusInterval = 60 * time.Second
 
 	// DefaultProcessAliveStatusInterval 默认进程存活状态检测间隔
 	// 进程存活状态检测频率，平衡实时性和性能开销
-	DefaultProcessAliveStatusInterval = time.Minute
+	DefaultProcessAliveStatusInterval = 60 * time.Second
 
 	// DefaultProcessStatusInterval 默认进程状态检测间隔
 	// 进程详细状态（CPU、内存等）检测频率
-	DefaultProcessStatusInterval = 30 * time.Second
+	DefaultProcessStatusInterval = 60 * time.Second
 
 	// DefaultProcessPidCacheCleanInterval 默认进程PID缓存清理间隔
 	// 定期清理过期的进程PID缓存，防止内存泄漏
@@ -135,7 +138,446 @@ const (
 	// 用于预分配字符串构建器容量，提高字符串拼接效率
 	DefaultStringBuilderCapacity = 64
 
+	// ========== 错误处理常量 ==========
+	// DefaultMemTotalKB 默认内存总量（KB），防止除零错误
+	DefaultMemTotalKB = 1024 * 1024
+
+	// MaxRetryAttempts 最大重试次数
+	MaxRetryAttempts = 3
+
+	// RetryDelay 重试延迟时间
+	RetryDelay = 100 * time.Millisecond
+
+	// ========== 超时和限制常量 ==========
+	// MaxGoroutineTimeout 最大goroutine超时时间
+	MaxGoroutineTimeout = 30 * time.Second
+
+	// GoroutineCleanupTimeout goroutine清理超时时间
+	GoroutineCleanupTimeout = 5 * time.Second
+
+	// MaxFileDescriptorLimit 最大文件描述符限制
+	MaxFileDescriptorLimit = 1000
+
+	// ========== 缓存清理阈值 ==========
+	// CacheCleanupThreshold 缓存清理阈值（百分比）
+	CacheCleanupThreshold = 80
+
+	// MinCacheSize 最小缓存大小
+	MinCacheSize = 100
+
+	// ========== 字符串常量 ==========
+	// 文件系统路径常量
+	ProcPathPrefix     = "/proc"
+	ProcNetTCPPath     = "/proc/net/tcp"
+	ProcNetTCP6Path    = "/proc/net/tcp6"
+	ProcMemInfoPath    = "/proc/meminfo"
+	ProcFdSuffix       = "/fd"
+	ProcExeSuffix      = "/exe"
+	ProcCwdSuffix      = "/cwd"
+	ProcStatusSuffix   = "/status"
+	ProcStatSuffix     = "/stat"
+	ProcIOSuffix       = "/io"
+	ProcCgroupPath     = "/proc/1/cgroup"
+
+	// 网络相关常量
+	SocketPrefix       = "socket:["
+	SocketSuffix       = "]"
+	TCPListenState     = "0A"
+	TCPProtocol        = "tcp"
+	UDPProtocol        = "udp"
+
+	// 进程状态常量
+	ProcessStateRunning    = "R"
+	ProcessStateSleeping   = "S"
+	ProcessStateDiskWait   = "D"
+	ProcessStateZombie     = "Z"
+	ProcessStateTraced     = "T"
+	ProcessStatePaging     = "t"
+	ProcessStateWakeKill   = "W"
+	ProcessStateDead       = "X"
+	ProcessStateWakeDead   = "x"
+	ProcessStateKillable   = "K"
+
+	// 文件系统标识符
+	HostProcPrefix     = "/host/proc"
+	DockerIdentifier   = "docker"
+	KubepodsIdentifier = "kubepods"
+
+	// 网络接口前缀（虚拟网卡）
+	DockerInterfacePrefix  = "docker"
+	VethInterfacePrefix   = "veth"
+	BridgeInterfacePrefix  = "br-"
+	VirbrInterfacePrefix  = "virbr"
+	LoopbackInterface     = "lo"
+	VMNetInterfacePrefix  = "vmnet"
+	TapInterfacePrefix    = "tap"
+	TunInterfacePrefix     = "tun"
+	WlxInterfacePrefix    = "wlx"
+	EnxInterfacePrefix    = "enx"
+
+	// 常用IP地址
+	LocalhostIPv4     = "127.0.0.1"
+	AnyIPv4           = "0.0.0.0"
+	LocalhostIPv6     = "::1"
+	AnyIPv6           = "::"
+
+	// 进程排除列表（默认）
+	DefaultExcludedProcesses = []string{
+		"systemd",
+		"init",
+		"kthreadd",
+		"ksoftirqd",
+		"rcu_sched",
+		"rcu_bh",
+		"bo-agent",
+		"migration",
+		"watchdog",
+		"cpuhp",
+		"netns",
+		"khungtaskd",
+		"oom_reaper",
+		"chronyd",
+		"kswapd",
+		"fsnotify_mark",
+		"ecryptfs-kthrea",
+		"kauditd",
+		"khubd",
+		"ssh",
+		"snmpd",
+		"zabbix",
+		"prometheus",
+		"rpcbind",
+		"smartdns",
+		"cupsd",
+		"dhclient",
+		"master",
+		"rpc.statd",
+		"titanagent",
+		"node_exporter",
+		"monitor_manage",
+		"dnsmasq",
+	}
+
+	// 字符串分隔符
+	ProcessKeySeparator   = "|"
+	PidKeySeparator       = "_"
+	PathSeparator         = "/"
+	ColonSeparator        = ":"
+	CommaSeparator        = ","
+	SpaceSeparator        = " "
+
+	// 默认标签值
+	DefaultLabelValue     = "/"
+	EmptyString           = ""
+
+	// 日志标识符
+	LogPrefix             = "[simple_port_process_collector]"
+	PortProcessLogPrefix  = "[port_process_collector]"
+
+	// 环境变量名称
+	EnvDebugPortCheck              = "DEBUG_PORT_CHECK"
+	EnvEnableHostIPDetection       = "ENABLE_HOST_IP_DETECTION"
+	EnvPortLabelInterval           = "PORT_LABEL_INTERVAL"
+	EnvProcPrefix                  = "PROC_PREFIX"
+	EnvPortStatusInterval          = "PORT_STATUS_INTERVAL"
+	EnvProcessAliveStatusInterval  = "PROCESS_ALIVE_STATUS_INTERVAL"
+	EnvPortCheckTimeout            = "PORT_CHECK_TIMEOUT"
+	EnvMaxParallelIPChecks         = "MAX_PARALLEL_IP_CHECKS"
+	EnvFastMode                    = "FAST_MODE"
+	EnvProcessHz                   = "PROCESS_HZ"
+	EnvProcessStatusInterval       = "PROCESS_STATUS_INTERVAL"
+	EnvProcessPidCacheCleanInterval = "PROCESS_PID_CACHE_CLEAN_INTERVAL"
+	EnvEnableProcessAggregation    = "ENABLE_PROCESS_AGGREGATION"
+	EnvExcludedProcessNames        = "EXCLUDED_PROCESS_NAMES"
+	EnvHostIPCacheInterval         = "HOST_IP_CACHE_INTERVAL"
+
+	// 性能统计操作名称
+	OpPortScan         = "port_scan"
+	OpProcessScan      = "process_scan"
+	OpCacheHit         = "cache_hit"
+	OpCacheMiss        = "cache_miss"
+	OpPanicRecovery    = "panic_recovery"
+
+	// Goroutine名称
+	GoroutineTCPDetectionWorker     = "tcp-detection-worker"
+	GoroutineProcessDetectionWorker = "process-detection-worker"
+	GoroutineProcessStatusWorker    = "process-status-worker"
+	GoroutinePidCacheCleanWorker    = "pid-cache-clean-worker"
+	GoroutineMemoryCleanupWorker    = "memory-cleanup-worker"
+
+	// 错误消息模板
+	ErrMsgFailedToOpenProc          = "failed to open /proc: %v"
+	ErrMsgFailedToCloseProc         = "failed to close /proc: %v"
+	ErrMsgFailedToReadProc          = "failed to read /proc: %v"
+	ErrMsgFailedToReadFile          = "failed to read %s: %v"
+	ErrMsgFailedToReadlink          = "failed to readlink %s: %v"
+	ErrMsgInvalidPortNumber         = "invalid port number: %d"
+	ErrMsgPortDetectionTimeout      = "TCP检测超时，部分goroutine可能仍在运行"
+	ErrMsgGoroutineTimeout          = "超时后仍有goroutine未退出"
+	ErrMsgGoroutinePanic            = "goroutine %s panic recovered: %v"
+	ErrMsgGoroutineTimeoutShutdown = "goroutine %s did not finish within timeout"
+
+	// 状态文件字段名
+	StatusFieldUid                    = "Uid:"
+	StatusFieldVmrss                  = "vmrss"
+	StatusFieldVmsize                 = "vmsize"
+	StatusFieldThreads                = "threads"
+	StatusFieldVoluntaryCtxtSwitches  = "voluntary_ctxt_switches"
+	StatusFieldNonvoluntaryCtxtSwitches = "nonvoluntary_ctxt_switches"
+
+	// IO文件字段名
+	IOFieldReadBytes  = "read_bytes:"
+	IOFieldWriteBytes = "write_bytes:"
+
+	// 内存信息字段名
+	MemInfoFieldMemTotal = "MemTotal:"
+
+	// 单位标识符
+	UnitKB = "kB"
+	UnitMB = "MB"
+	UnitGB = "GB"
+
 )
+
+// ========== 安全资源管理结构体 ==========
+
+// SafeFileHandle 安全的文件句柄管理
+// 提供自动关闭和错误处理的文件操作封装
+type SafeFileHandle struct {
+	file *os.File
+	path string
+}
+
+// NewSafeFileHandle 创建安全的文件句柄
+func NewSafeFileHandle(path string) (*SafeFileHandle, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open file %s: %w", path, err)
+	}
+	return &SafeFileHandle{file: file, path: path}, nil
+}
+
+// Close 安全关闭文件句柄
+func (sfh *SafeFileHandle) Close() error {
+	if sfh.file == nil {
+		return nil
+	}
+	err := sfh.file.Close()
+	sfh.file = nil
+	if err != nil {
+		log.Printf("[simple_port_process_collector] failed to close file %s: %v", sfh.path, err)
+	}
+	return err
+}
+
+// Read 读取文件内容
+func (sfh *SafeFileHandle) Read() ([]byte, error) {
+	if sfh.file == nil {
+		return nil, fmt.Errorf("file handle is closed")
+	}
+	return os.ReadFile(sfh.path)
+}
+
+// ReadDir 读取目录内容
+func (sfh *SafeFileHandle) ReadDir() ([]os.DirEntry, error) {
+	if sfh.file == nil {
+		return nil, fmt.Errorf("file handle is closed")
+	}
+	return sfh.file.ReadDir(-1)
+}
+
+// SafeGoroutineManager 安全的goroutine管理器
+// 提供goroutine生命周期管理和泄漏防护
+type SafeGoroutineManager struct {
+	activeGoroutines sync.Map // map[string]*GoroutineInfo
+	shutdown         chan struct{}
+	once             sync.Once
+}
+
+// GoroutineInfo goroutine信息
+type GoroutineInfo struct {
+	Name      string
+	StartTime time.Time
+	Done      chan struct{}
+}
+
+// NewSafeGoroutineManager 创建安全的goroutine管理器
+func NewSafeGoroutineManager() *SafeGoroutineManager {
+	return &SafeGoroutineManager{
+		shutdown: make(chan struct{}),
+	}
+}
+
+// StartGoroutine 启动受管理的goroutine
+func (sgm *SafeGoroutineManager) StartGoroutine(name string, fn func()) {
+	info := &GoroutineInfo{
+		Name:      name,
+		StartTime: time.Now(),
+		Done:      make(chan struct{}),
+	}
+
+	sgm.activeGoroutines.Store(name, info)
+
+	go func() {
+		defer func() {
+			close(info.Done)
+			sgm.activeGoroutines.Delete(name)
+			if r := recover(); r != nil {
+				log.Printf("[simple_port_process_collector] goroutine %s panic recovered: %v", name, r)
+			}
+		}()
+
+		fn()
+	}()
+}
+
+// Shutdown 优雅关闭所有goroutine
+func (sgm *SafeGoroutineManager) Shutdown() {
+	sgm.once.Do(func() {
+		close(sgm.shutdown)
+
+		// 等待所有goroutine完成
+		sgm.activeGoroutines.Range(func(key, value interface{}) bool {
+			if info, ok := value.(*GoroutineInfo); ok {
+				select {
+				case <-info.Done:
+					// goroutine已完成
+				case <-time.After(MaxGoroutineTimeout):
+					log.Printf("[simple_port_process_collector] goroutine %s did not finish within timeout", info.Name)
+				}
+			}
+			return true
+		})
+	})
+}
+
+// GetActiveCount 获取活跃goroutine数量
+func (sgm *SafeGoroutineManager) GetActiveCount() int {
+	count := 0
+	sgm.activeGoroutines.Range(func(key, value interface{}) bool {
+		count++
+		return true
+	})
+	return count
+}
+
+// SafeStringBuilder 安全的字符串构建器
+// 提供预分配容量和错误处理的字符串拼接
+type SafeStringBuilder struct {
+	builder strings.Builder
+	capacity int
+}
+
+// NewSafeStringBuilder 创建安全的字符串构建器
+func NewSafeStringBuilder(capacity int) *SafeStringBuilder {
+	sb := &SafeStringBuilder{capacity: capacity}
+	sb.builder.Grow(capacity)
+	return sb
+}
+
+// WriteString 写入字符串
+func (ssb *SafeStringBuilder) WriteString(s string) {
+	ssb.builder.WriteString(s)
+}
+
+// WriteByte 写入字节
+func (ssb *SafeStringBuilder) WriteByte(c byte) {
+	ssb.builder.WriteByte(c)
+}
+
+// String 获取字符串结果
+func (ssb *SafeStringBuilder) String() string {
+	return ssb.builder.String()
+}
+
+// Reset 重置构建器
+func (ssb *SafeStringBuilder) Reset() {
+	ssb.builder.Reset()
+	ssb.builder.Grow(ssb.capacity)
+}
+
+// StringPool 字符串池，用于复用常用字符串
+type StringPool struct {
+	pool sync.Pool
+}
+
+// NewStringPool 创建字符串池
+func NewStringPool() *StringPool {
+	return &StringPool{
+		pool: sync.Pool{
+			New: func() interface{} {
+				return NewSafeStringBuilder(DefaultStringBuilderCapacity)
+			},
+		},
+	}
+}
+
+// Get 从池中获取字符串构建器
+func (sp *StringPool) Get() *SafeStringBuilder {
+	return sp.pool.Get().(*SafeStringBuilder)
+}
+
+// Put 将字符串构建器放回池中
+func (sp *StringPool) Put(sb *SafeStringBuilder) {
+	sb.Reset()
+	sp.pool.Put(sb)
+}
+
+// 全局字符串池
+var globalStringPool = NewStringPool()
+
+// StringUtils 字符串工具类
+type StringUtils struct{}
+
+// BuildPath 构建文件路径
+func (su *StringUtils) BuildPath(parts ...string) string {
+	sb := globalStringPool.Get()
+	defer globalStringPool.Put(sb)
+
+	for i, part := range parts {
+		if i > 0 && !strings.HasSuffix(sb.String(), PathSeparator) {
+			sb.WriteString(PathSeparator)
+		}
+		sb.WriteString(part)
+	}
+	return sb.String()
+}
+
+// BuildProcessKey 构建进程键
+func (su *StringUtils) BuildProcessKey(processName, exePath string) string {
+	sb := globalStringPool.Get()
+	defer globalStringPool.Put(sb)
+
+	sb.WriteString(processName)
+	sb.WriteString(ProcessKeySeparator)
+	sb.WriteString(exePath)
+	return sb.String()
+}
+
+// BuildPidKey 构建PID键
+func (su *StringUtils) BuildPidKey(pid int, startTime string) string {
+	sb := globalStringPool.Get()
+	defer globalStringPool.Put(sb)
+
+	sb.WriteString(strconv.Itoa(pid))
+	sb.WriteString(PidKeySeparator)
+	sb.WriteString(startTime)
+	return sb.String()
+}
+
+// BuildSocketPath 构建socket路径
+func (su *StringUtils) BuildSocketPath(fdPath, fdName string) string {
+	sb := globalStringPool.Get()
+	defer globalStringPool.Put(sb)
+
+	sb.WriteString(fdPath)
+	sb.WriteString(PathSeparator)
+	sb.WriteString(fdName)
+	return sb.String()
+}
+
+// 全局字符串工具实例
+var stringUtils = &StringUtils{}
 
 // ========== 可配置变量区域 ==========
 // 这些变量支持通过环境变量进行配置，提供运行时灵活性
@@ -143,7 +585,7 @@ const (
 // EnablePortCheckDebugLog 是否启用端口检测调试日志
 // 通过环境变量 DEBUG_PORT_CHECK 控制，默认为 true
 var EnablePortCheckDebugLog = func() bool {
-	if v := os.Getenv("DEBUG_PORT_CHECK"); v != "" {
+	if v := os.Getenv(EnvDebugPortCheck); v != EmptyString {
 		enabled, err := strconv.ParseBool(v)
 		if err == nil {
 			return enabled
@@ -155,7 +597,7 @@ var EnablePortCheckDebugLog = func() bool {
 // EnableHostIPDetection 是否启用宿主机IP检测
 // 通过环境变量 ENABLE_HOST_IP_DETECTION 控制，默认为 true
 var EnableHostIPDetection = func() bool {
-	if v := os.Getenv("ENABLE_HOST_IP_DETECTION"); v != "" {
+	if v := os.Getenv(EnvEnableHostIPDetection); v != EmptyString {
 		enabled, err := strconv.ParseBool(v)
 		if err == nil {
 			return enabled
@@ -169,7 +611,7 @@ var EnableHostIPDetection = func() bool {
 // 如果环境变量解析失败，则使用默认值 DefaultScanInterval
 var scanInterval = func() time.Duration {
 	// 尝试从环境变量读取配置
-	if v := os.Getenv("PORT_LABEL_INTERVAL"); v != "" {
+	if v := os.Getenv(EnvPortLabelInterval); v != EmptyString {
 		// 解析环境变量中的时间间隔
 		d, err := time.ParseDuration(v)
 		if err == nil {
@@ -184,26 +626,29 @@ var scanInterval = func() time.Duration {
 // 支持容器环境下的进程文件系统访问
 var procPrefix = func() string {
 	// 尝试从环境变量读取配置
-	if p := os.Getenv("PROC_PREFIX"); p != "" {
+	if p := os.Getenv(EnvProcPrefix); p != EmptyString {
 		return p
 	}
 	// 自动判断容器环境
-	cgroupFile := "/proc/1/cgroup"
+	cgroupFile := ProcCgroupPath
 	content, err := os.ReadFile(cgroupFile)
 	if err == nil {
 		s := string(content)
 		// 检查是否为容器环境
-		if strings.Contains(s, "docker") || strings.Contains(s, "kubepods") {
-			return "/host/proc" // 容器环境下使用主机进程文件系统
+		if strings.Contains(s, DockerIdentifier) || strings.Contains(s, KubepodsIdentifier) {
+			return HostProcPrefix // 容器环境下使用主机进程文件系统
 		}
 	}
-	return "" // 非容器环境使用默认路径
+	return EmptyString // 非容器环境使用默认路径
 }()
 
 // procPath 辅助函数：构建完整的进程文件系统路径
 // 根据配置的前缀和相对路径，构建完整的文件系统路径
 func procPath(path string) string {
-	return procPrefix + path
+	if procPrefix == EmptyString {
+		return path
+	}
+	return stringUtils.BuildPath(procPrefix, path)
 }
 
 // ========== 主要收集器结构体 ==========
@@ -340,7 +785,7 @@ var processDetectionQueue = struct {
 // 该函数启动一个后台goroutine，定期处理TCP端口检测队列
 // 使用异步处理避免阻塞Prometheus指标暴露
 func startTCPDetectionWorker() {
-	go func() {
+	goroutineManager.StartGoroutine(GoroutineTCPDetectionWorker, func() {
 		// 创建定时器，按照配置的间隔定期处理检测队列
 		ticker := time.NewTicker(portStatusInterval)
 		defer ticker.Stop() // 确保定时器被正确关闭
@@ -353,91 +798,107 @@ func startTCPDetectionWorker() {
 				return
 			case <-ticker.C:
 				// 定时器触发，处理队列中的端口检测任务
-
-				// 获取待检测的端口列表（加锁保护）
-				tcpDetectionQueue.Lock()
-				ports := makeSliceWithCapacity[int](len(tcpDetectionQueue.ports))
-				for port := range tcpDetectionQueue.ports {
-					ports = append(ports, port)
-				}
-				// 清空队列，避免重复检测
-				tcpDetectionQueue.ports = make(map[int]bool)
-				tcpDetectionQueue.Unlock()
-
-				// 异步检测所有排队的端口
-				// 使用信号量控制并发数，避免过多并发导致系统负载过高
-				sem := make(chan struct{}, maxParallelIPChecks)
-				var wg sync.WaitGroup // 等待组，用于等待所有检测任务完成
-
-				for _, port := range ports {
-					wg.Add(1) // 增加等待计数
-					go func(p int) {
-						defer wg.Done() // 任务完成时减少等待计数
-
-						// panic恢复机制，确保单个端口检测失败不影响其他端口
-						defer recoverFromPanic("TCP检测", p)
-
-						// 获取信号量，控制并发数
-						sem <- struct{}{}
-						defer func() { <-sem }() // 释放信号量
-
-						// 根据配置选择检测模式
-						var alive int
-						var respTime float64
-						if fastMode {
-							// 快速模式下使用更短的超时时间，提高检测速度
-							alive, respTime = checkPortTCPWithTimeout(p, 500*time.Millisecond)
-						} else {
-							// 标准模式使用默认超时时间
-							alive, respTime = checkPortTCP(p)
-						}
-
-						// 更新端口状态缓存
-						portStatusCache.RWMutex.Lock()
-						portStatusCache.Status[p] = alive
-						// 如果端口挂了，响应时间设为0
-						if alive == 0 {
-							portStatusCache.ResponseTime[p] = 0
-						} else {
-							portStatusCache.ResponseTime[p] = respTime
-						}
-						portStatusCache.LastCheck[p] = time.Now()
-						portStatusCache.RWMutex.Unlock()
-
-					}(port)
-				}
-
-				// 使用带超时的等待，避免goroutine泄漏的同时防止阻塞
-				done := make(chan struct{})
-				go func() {
-					wg.Wait() // 等待所有检测任务完成
-					close(done) // 关闭完成信号通道
-				}()
-
-				select {
-				case <-done:
-					// 所有goroutine正常完成
-				case <-time.After(30 * time.Second):
-					// 超时，记录警告但不阻塞
-					log.Printf("[port_process_collector] TCP检测超时，部分goroutine可能仍在运行")
-					// 等待一小段时间让goroutine有机会退出
-					select {
-					case <-done:
-						// goroutine已经完成
-					case <-time.After(5 * time.Second):
-						log.Printf("[port_process_collector] 超时后仍有goroutine未退出")
-					}
-				}
+				processTCPDetectionQueue()
 			}
 		}
+	})
+}
+
+// processTCPDetectionQueue 处理TCP检测队列
+// 分离出独立的函数，便于测试和错误处理
+func processTCPDetectionQueue() {
+	// 获取待检测的端口列表（加锁保护）
+	tcpDetectionQueue.Lock()
+	ports := makeSliceWithCapacity[int](len(tcpDetectionQueue.ports))
+	for port := range tcpDetectionQueue.ports {
+		ports = append(ports, port)
+	}
+	// 清空队列，避免重复检测
+	tcpDetectionQueue.ports = make(map[int]bool)
+	tcpDetectionQueue.Unlock()
+
+	if len(ports) == 0 {
+		return // 没有待检测的端口
+	}
+
+	// 异步检测所有排队的端口
+	// 使用信号量控制并发数，避免过多并发导致系统负载过高
+	sem := make(chan struct{}, maxParallelIPChecks)
+	var wg sync.WaitGroup // 等待组，用于等待所有检测任务完成
+
+	for _, port := range ports {
+		wg.Add(1) // 增加等待计数
+		go func(p int) {
+			defer wg.Done() // 任务完成时减少等待计数
+
+			// panic恢复机制，确保单个端口检测失败不影响其他端口
+			defer recoverFromPanic("TCP检测", p)
+
+			// 获取信号量，控制并发数
+			sem <- struct{}{}
+			defer func() { <-sem }() // 释放信号量
+
+			// 根据配置选择检测模式
+			var alive int
+			var respTime float64
+			if fastMode {
+				// 快速模式下使用更短的超时时间，提高检测速度
+				alive, respTime = checkPortTCPWithTimeout(p, 500*time.Millisecond)
+			} else {
+				// 标准模式使用默认超时时间
+				alive, respTime = checkPortTCP(p)
+			}
+
+			// 原子更新端口状态缓存
+			updatePortStatusCache(p, alive, respTime)
+
+		}(port)
+	}
+
+	// 使用带超时的等待，避免goroutine泄漏的同时防止阻塞
+	done := make(chan struct{})
+	go func() {
+		wg.Wait() // 等待所有检测任务完成
+		close(done) // 关闭完成信号通道
 	}()
+
+	select {
+	case <-done:
+		// 所有goroutine正常完成
+		case <-time.After(MaxGoroutineTimeout):
+			// 超时，记录警告但不阻塞
+			log.Printf("%s %s", PortProcessLogPrefix, ErrMsgPortDetectionTimeout)
+			// 等待一小段时间让goroutine有机会退出
+			select {
+			case <-done:
+				// goroutine已经完成
+			case <-time.After(GoroutineCleanupTimeout):
+				log.Printf("%s %s", PortProcessLogPrefix, ErrMsgGoroutineTimeout)
+			}
+	}
+}
+
+// updatePortStatusCache 原子更新端口状态缓存
+// 提供线程安全的端口状态更新
+func updatePortStatusCache(port int, alive int, respTime float64) {
+	portStatusCache.RWMutex.Lock()
+	defer portStatusCache.RWMutex.Unlock()
+
+	portStatusCache.Status[port] = alive
+	// 如果端口挂了，响应时间设为0
+	if alive == 0 {
+		portStatusCache.ResponseTime[port] = 0
+	} else {
+		portStatusCache.ResponseTime[port] = respTime
+	}
+	portStatusCache.LastCheck[port] = time.Now()
 }
 
 // startProcessDetectionWorker 进程检测异步处理器
 // 该函数启动一个后台goroutine，定期处理进程存活检测队列
 // 使用异步处理避免阻塞Prometheus指标暴露
 func startProcessDetectionWorker() {
-	go func() {
+	goroutineManager.StartGoroutine(GoroutineProcessDetectionWorker, func() {
 		// 创建定时器，按照配置的间隔定期处理检测队列
 		ticker := time.NewTicker(processAliveStatusInterval)
 		defer ticker.Stop() // 确保定时器被正确关闭
@@ -450,43 +911,59 @@ func startProcessDetectionWorker() {
 				return
 			case <-ticker.C:
 				// 定时器触发，处理队列中的进程检测任务
-
-				// 获取待检测的进程ID列表（加锁保护）
-				processDetectionQueue.Lock()
-				pids := makeSliceWithCapacity[int](len(processDetectionQueue.pids))
-				for pid := range processDetectionQueue.pids {
-					pids = append(pids, pid)
-				}
-				// 清空队列，避免重复检测
-				processDetectionQueue.pids = make(map[int]bool)
-				processDetectionQueue.Unlock()
-
-				// 异步检测所有排队的进程
-				var wg sync.WaitGroup // 等待组，用于等待所有检测任务完成
-				for _, pid := range pids {
-					wg.Add(1) // 增加等待计数
-					go func(p int) {
-						defer wg.Done() // 任务完成时减少等待计数
-
-						// panic恢复机制，确保单个进程检测失败不影响其他进程
-						defer recoverFromPanic("进程检测", p)
-
-						// 检测进程是否存活
-						status := checkProcess(p)
-						key := getPidKey(p) // 获取进程的唯一标识键
-
-						// 更新进程存活状态缓存
-						processAliveCache.RWMutex.Lock()
-						processAliveCache.Status[key] = status
-						processAliveCache.LastCheck[key] = time.Now()
-						processAliveCache.RWMutex.Unlock()
-
-					}(pid)
-				}
-				wg.Wait() // 等待所有检测任务完成
+				processProcessDetectionQueue()
 			}
 		}
-	}()
+	})
+}
+
+// processProcessDetectionQueue 处理进程检测队列
+// 分离出独立的函数，便于测试和错误处理
+func processProcessDetectionQueue() {
+	// 获取待检测的进程ID列表（加锁保护）
+	processDetectionQueue.Lock()
+	pids := makeSliceWithCapacity[int](len(processDetectionQueue.pids))
+	for pid := range processDetectionQueue.pids {
+		pids = append(pids, pid)
+	}
+	// 清空队列，避免重复检测
+	processDetectionQueue.pids = make(map[int]bool)
+	processDetectionQueue.Unlock()
+
+	if len(pids) == 0 {
+		return // 没有待检测的进程
+	}
+
+	// 异步检测所有排队的进程
+	var wg sync.WaitGroup // 等待组，用于等待所有检测任务完成
+	for _, pid := range pids {
+		wg.Add(1) // 增加等待计数
+		go func(p int) {
+			defer wg.Done() // 任务完成时减少等待计数
+
+			// panic恢复机制，确保单个进程检测失败不影响其他进程
+			defer recoverFromPanic("进程检测", p)
+
+			// 检测进程是否存活
+			status := checkProcess(p)
+			key := getPidKey(p) // 获取进程的唯一标识键
+
+			// 原子更新进程存活状态缓存
+			updateProcessAliveCache(key, status)
+
+		}(pid)
+	}
+	wg.Wait() // 等待所有检测任务完成
+}
+
+// updateProcessAliveCache 原子更新进程存活状态缓存
+// 提供线程安全的进程状态更新
+func updateProcessAliveCache(key string, status int) {
+	processAliveCache.RWMutex.Lock()
+	defer processAliveCache.RWMutex.Unlock()
+
+	processAliveCache.Status[key] = status
+	processAliveCache.LastCheck[key] = time.Now()
 }
 
 // startProcessPidCacheCleanWorker 进程PID缓存清理工作器
@@ -561,6 +1038,9 @@ func ShutdownWorkers() {
 		close(processStatusDetectionQueue.done)  // 关闭进程状态检测队列
 		close(processPidCacheCleanQueue.done)    // 关闭进程PID缓存清理队列
 		close(memoryCleanupQueue.done)           // 关闭内存清理队列
+
+		// 使用goroutine管理器优雅关闭所有goroutine
+		goroutineManager.Shutdown()
 	})
 }
 
@@ -1109,26 +1589,25 @@ func discoverPortProcess() []PortProcessInfo {
 
 	// 第一步：解析网络连接表，建立inode到端口的映射
 	// 同时解析IPv4和IPv6的TCP连接表
-	tcpInodePort := parseInodePortMap([]string{"/proc/net/tcp", "/proc/net/tcp6"}, "tcp")
+	tcpInodePort := parseInodePortMap([]string{ProcNetTCPPath, ProcNetTCP6Path}, TCPProtocol)
 	seenTCP := make(map[int]bool) // 用于去重，避免重复处理同一端口
 
 	// 第二步：打开/proc目录，遍历所有进程
-	procDir, err := os.Open(procPath("/proc"))
+	procHandle, err := NewSafeFileHandle(procPath(ProcPathPrefix))
 	if err != nil {
-		log.Printf("[simple_port_process_collector] failed to open /proc: %v\n", err)
+		log.Printf("%s %s\n", LogPrefix, fmt.Sprintf(ErrMsgFailedToOpenProc, err))
 		return results
 	}
 	defer func() {
-		// 确保目录被正确关闭，并记录关闭错误
-		if closeErr := procDir.Close(); closeErr != nil {
-			log.Printf("[simple_port_process_collector] failed to close /proc: %v\n", closeErr)
+		if closeErr := procHandle.Close(); closeErr != nil {
+			log.Printf("%s %s\n", LogPrefix, fmt.Sprintf(ErrMsgFailedToCloseProc, closeErr))
 		}
 	}()
 
 	// 读取/proc目录中的所有条目
-	entries, err := procDir.Readdir(-1)
+	entries, err := procHandle.ReadDir()
 	if err != nil {
-		log.Printf("[simple_port_process_collector] failed to read /proc: %v\n", err)
+		log.Printf("%s %s\n", LogPrefix, fmt.Sprintf(ErrMsgFailedToReadProc, err))
 		return results
 	}
 
@@ -1146,42 +1625,43 @@ func discoverPortProcess() []PortProcessInfo {
 		}
 
 		// 第四步：读取进程的文件描述符目录
-		// 使用strings.Builder优化字符串拼接
-		var pathBuilder strings.Builder
-		pathBuilder.Grow(len("/proc/") + len(entry.Name()) + len("/fd"))
-		pathBuilder.WriteString("/proc/")
-		pathBuilder.WriteString(entry.Name())
-		pathBuilder.WriteString("/fd")
-		fdPath := procPath(pathBuilder.String())
-		fds, err := os.ReadDir(fdPath)
+		// 使用字符串工具构建路径
+		fdPath := stringUtils.BuildPath(ProcPathPrefix, entry.Name(), ProcFdSuffix)
+
+		fdHandle, err := NewSafeFileHandle(procPath(fdPath))
 		if err != nil {
-			log.Printf("[simple_port_process_collector] failed to read %s: %v\n", fdPath, err)
+			log.Printf("%s %s\n", LogPrefix, fmt.Sprintf(ErrMsgFailedToReadFile, fdPath, err))
+			continue
+		}
+
+		fds, err := fdHandle.ReadDir()
+		fdHandle.Close() // 立即关闭文件句柄
+		if err != nil {
+			log.Printf("%s %s\n", LogPrefix, fmt.Sprintf(ErrMsgFailedToReadFile, fdPath, err))
 			continue
 		}
 
 		// 第五步：遍历进程的所有文件描述符
 		for _, fdEntry := range fds {
-			// 使用strings.Builder优化字符串拼接
-			var builder strings.Builder
-			builder.Grow(len(fdPath) + len(fdEntry.Name()) + 1)
-			builder.WriteString(fdPath)
-			builder.WriteString("/")
-			builder.WriteString(fdEntry.Name())
-			fdLink := builder.String()
+			// 使用字符串工具构建socket路径
+			fdLink := stringUtils.BuildSocketPath(fdPath, fdEntry.Name())
 
 			link, err := os.Readlink(fdLink)
 			if err != nil {
-				log.Printf("[simple_port_process_collector] failed to readlink %s: %v\n", fdLink, err)
+				log.Printf("%s %s\n", LogPrefix, fmt.Sprintf(ErrMsgFailedToReadlink, fdLink, err))
 				continue
 			}
 
 			// 只处理socket类型的文件描述符
-			if !strings.HasPrefix(link, "socket:[") {
+			if !strings.HasPrefix(link, SocketPrefix) {
 				continue
 			}
 
 			// 提取socket的inode号
-			inode := link[8 : len(link)-1]
+			if len(link) < len(SocketPrefix)+len(SocketSuffix) {
+				continue // 防止越界访问
+			}
+			inode := link[len(SocketPrefix) : len(link)-len(SocketSuffix)]
 
 			// 第六步：检查TCP端口映射
 			if port, ok := tcpInodePort[inode]; ok {
@@ -1208,7 +1688,7 @@ func discoverPortProcess() []PortProcessInfo {
 					Pid:         pid,                                   // 进程ID
 					WorkDir:     safeLabel(getProcessCwd(pid)),         // 工作目录（安全标签）
 					Username:    safeLabel(getProcessUser(pid)),       // 用户名（安全标签）
-					Protocol:    "tcp",                                // 协议类型
+					Protocol:    TCPProtocol,                          // 协议类型
 				})
 			}
 		}
@@ -1247,15 +1727,15 @@ func parseInodePortMap(files []string, proto string) map[string]int {
 			}
 
 			// 对于TCP协议，只处理LISTEN状态的连接
-			if proto == "tcp" && fields[3] != "0A" {
-				continue // 0A表示TCP LISTEN状态
+			if proto == TCPProtocol && fields[3] != TCPListenState {
+				continue // TCPListenState表示TCP LISTEN状态
 			}
 
 			// 提取socket inode号（第10个字段）
 			inode := fields[9]
 
 			// 解析地址和端口（第2个字段格式：IP:PORT）
-			addrParts := strings.Split(fields[1], ":")
+			addrParts := strings.Split(fields[1], ColonSeparator)
 			if len(addrParts) < 2 {
 				continue // 跳过格式不正确的地址
 			}
@@ -1328,7 +1808,11 @@ func getHostIPInfo() []HostIPInfo {
 
 // isVirtualHostInterface 判断是否为虚拟网卡（如 docker、veth、br-、virbr、lo 等）
 func isVirtualHostInterface(name string) bool {
-	virtualPrefixes := []string{"docker", "veth", "br-", "virbr", "lo", "vmnet", "tap", "tun", "wlx", "enx"}
+	virtualPrefixes := []string{
+		DockerInterfacePrefix, VethInterfacePrefix, BridgeInterfacePrefix, VirbrInterfacePrefix,
+		LoopbackInterface, VMNetInterfacePrefix, TapInterfacePrefix, TunInterfacePrefix,
+		WlxInterfacePrefix, EnxInterfacePrefix,
+	}
 	for _, prefix := range virtualPrefixes {
 		if strings.HasPrefix(name, prefix) {
 			return true
@@ -1384,7 +1868,7 @@ func getHostIPs() []string {
 	for _, info := range hostIPInfos {
 		hostIPs = append(hostIPs, info.IPAddresses...)
 		if EnablePortCheckDebugLog {
-			log.Printf("[simple_port_process_collector] 从物理网卡 %s 获取宿主机IP: %v", info.InterfaceName, info.IPAddresses)
+			log.Printf("%s 从物理网卡 %s 获取宿主机IP: %v", LogPrefix, info.InterfaceName, info.IPAddresses)
 		}
 	}
 
@@ -1417,7 +1901,7 @@ func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTi
 	}
 
 	// 定义常用IP地址列表，优先检测这些地址
-	commonAddrs := []string{"127.0.0.1", "0.0.0.0", "::1", "::"}
+	commonAddrs := []string{LocalhostIPv4, AnyIPv4, LocalhostIPv6, AnyIPv6}
 	minResp := -1.0
 	found := false
 	var failedAddrs []string // 记录失败的地址
@@ -1435,14 +1919,14 @@ func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTi
 			found = true
 			// 可选：记录成功的连接（仅在调试模式下）
 			if EnablePortCheckDebugLog {
-				log.Printf("[simple_port_process_collector] 端口 %d 在地址 %s 检测成功，响应时间: %.3f秒", port, ip, cost)
+				log.Printf("%s 端口 %d 在地址 %s 检测成功，响应时间: %.3f秒", LogPrefix, port, ip, cost)
 			}
 		} else {
 			// 记录失败的地址
 			failedAddrs = append(failedAddrs, ip)
 			// 可选：记录详细的错误信息（仅在调试模式下）
 			if EnablePortCheckDebugLog {
-				log.Printf("[simple_port_process_collector] 端口 %d 在地址 %s 检测失败: %v", port, ip, err)
+				log.Printf("%s 端口 %d 在地址 %s 检测失败: %v", LogPrefix, port, ip, err)
 			}
 		}
 	}
@@ -1460,7 +1944,7 @@ func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTi
 		hostIPs := getHostIPs()
 		addrs = append(addrs, hostIPs...)
 		if EnablePortCheckDebugLog && len(hostIPs) > 0 {
-			log.Printf("[simple_port_process_collector] 检测到宿主机IP: %v", hostIPs)
+			log.Printf("%s 检测到宿主机IP: %v", LogPrefix, hostIPs)
 		}
 	}
 
@@ -1497,7 +1981,7 @@ func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTi
 
 	if len(addrs) == 0 {
 		// 记录所有常用地址都失败的情况
-		log.Printf("[simple_port_process_collector] 端口 %d 检测失败: 常用地址 %v 均不可达", port, failedAddrs)
+		log.Printf("%s 端口 %d 检测失败: 常用地址 %v 均不可达", LogPrefix, port, failedAddrs)
 		return 0, 0
 	}
 
@@ -1528,7 +2012,7 @@ func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTi
 				cost := time.Since(start).Seconds()
 				// 可选：记录成功的连接（仅在调试模式下）
 				if EnablePortCheckDebugLog {
-					log.Printf("[simple_port_process_collector] 端口 %d 在地址 %s 检测成功，响应时间: %.3f秒", port, ip, cost)
+					log.Printf("%s 端口 %d 在地址 %s 检测成功，响应时间: %.3f秒", LogPrefix, port, ip, cost)
 				}
 				select {
 				case resultOnce <- cost:
@@ -1544,7 +2028,7 @@ func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTi
 				}
 				// 可选：记录详细的错误信息（仅在调试模式下）
 				if EnablePortCheckDebugLog {
-					log.Printf("[simple_port_process_collector] 端口 %d 在地址 %s 检测失败: %v", port, ip, err)
+					log.Printf("%s 端口 %d 在地址 %s 检测失败: %v", LogPrefix, port, ip, err)
 				}
 			}
 		}(ip)
@@ -1570,26 +2054,27 @@ func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTi
 		}
 	logFailure:
 		// 记录所有地址都失败的情况
-		log.Printf("[simple_port_process_collector] 端口 %d 检测失败: 常用地址 %v 和本地IP %v 均不可达", port, failedAddrs, addrs)
+		log.Printf("%s 端口 %d 检测失败: 常用地址 %v 和本地IP %v 均不可达", LogPrefix, port, failedAddrs, addrs)
 		return 0, 0
 	}
 }
 
 // isProcessValid 检查进程是否仍然有效（快速检查）
 func isProcessValid(pid int) bool {
-	statPath := procPath(fmt.Sprintf("/proc/%d/stat", pid))
-	_, err := os.Stat(statPath)
+	statPath := stringUtils.BuildPath(ProcPathPrefix, strconv.Itoa(pid), ProcStatSuffix)
+	_, err := os.Stat(procPath(statPath))
 	return err == nil
 }
 
 // getProcStatFields 安全解析 /proc/[pid]/stat，兼容 comm 字段含空格/括号
 func getProcStatFields(pid int) ([]string, error) {
-    content, err := os.ReadFile(procPath(fmt.Sprintf("/proc/%d/stat", pid)))
+	statPath := stringUtils.BuildPath(ProcPathPrefix, strconv.Itoa(pid), ProcStatSuffix)
+    content, err := os.ReadFile(procPath(statPath))
     if err != nil {
         return nil, err
     }
     s := strings.TrimSpace(string(content))
-    if s == "" {
+    if s == EmptyString {
         return nil, fmt.Errorf("empty stat file for pid %d", pid)
     }
 
@@ -1633,7 +2118,7 @@ func checkProcess(pid int) int {
     }
     // 检查进程状态：Z表示僵尸进程，视为死亡
     state := fields[2]
-	if state == "Z" {
+	if state == ProcessStateZombie {
 		return 0 // 僵尸进程视为死亡
 	}
 
@@ -1642,57 +2127,60 @@ func checkProcess(pid int) int {
 
 // getProcessExe 函数：获取进程的可执行文件路径
 func getProcessExe(pid int) string {
-	path, err := os.Readlink(procPath(fmt.Sprintf("/proc/%d/exe", pid)))
-	if err != nil || path == "" {
-		return "/"
+	exePath := stringUtils.BuildPath(ProcPathPrefix, strconv.Itoa(pid), ProcExeSuffix)
+	path, err := os.Readlink(procPath(exePath))
+	if err != nil || path == EmptyString {
+		return PathSeparator
 	}
 	return path
 }
 
 // getProcessCwd 函数：获取进程的工作目录
 func getProcessCwd(pid int) string {
-	path, err := os.Readlink(procPath(fmt.Sprintf("/proc/%d/cwd", pid)))
-	if err != nil || path == "" {
-		return "/"
+	cwdPath := stringUtils.BuildPath(ProcPathPrefix, strconv.Itoa(pid), ProcCwdSuffix)
+	path, err := os.Readlink(procPath(cwdPath))
+	if err != nil || path == EmptyString {
+		return PathSeparator
 	}
 	return path
 }
 
 // getProcessUser 函数：获取进程的运行用户（UID）
 func getProcessUser(pid int) string {
-	content, err := os.ReadFile(procPath(fmt.Sprintf("/proc/%d/status", pid)))
+	statusPath := stringUtils.BuildPath(ProcPathPrefix, strconv.Itoa(pid), ProcStatusSuffix)
+	content, err := os.ReadFile(procPath(statusPath))
 	if err != nil {
-		return "/"
+		return PathSeparator
 	}
 	lines := strings.Split(string(content), "\n")
 	for _, line := range lines {
-		if strings.HasPrefix(line, "Uid:") {
+		if strings.HasPrefix(line, StatusFieldUid) {
 			fields := strings.Fields(line)
-			if len(fields) >= 2 && fields[1] != "" {
+			if len(fields) >= 2 && fields[1] != EmptyString {
 				return fields[1]
 			}
 		}
 	}
-	return "/"
+	return PathSeparator
 }
 
 // safeLabel 保证 Prometheus 标签不为空，若为空则返回 "/"
 func safeLabel(val string) string {
-	if strings.TrimSpace(val) == "" {
-		return "/"
+	if strings.TrimSpace(val) == EmptyString {
+		return DefaultLabelValue
 	}
 	return val
 }
 
 var excludedProcessNames = func() []string {
-	env := os.Getenv("EXCLUDED_PROCESS_NAMES")
-	if env == "" {
+	env := os.Getenv(EnvExcludedProcessNames)
+	if env == EmptyString {
 		return nil
 	}
 	var result []string
-	for _, name := range strings.Split(env, ",") {
+	for _, name := range strings.Split(env, CommaSeparator) {
 		n := strings.TrimSpace(name)
-		if n != "" {
+		if n != EmptyString {
 			result = append(result, n)
 		}
 	}
@@ -1700,14 +2188,7 @@ var excludedProcessNames = func() []string {
 }()
 
 func isExcludedProcess(exeName string) bool {
-	defaultExcluded := []string{
-		"systemd", "init", "kthreadd", "ksoftirqd", "rcu_sched", "rcu_bh", "bo-agent",
-		"migration", "watchdog", "cpuhp", "netns", "khungtaskd", "oom_reaper", "chronyd",
-		"kswapd", "fsnotify_mark", "ecryptfs-kthrea", "kauditd", "khubd", "ssh", "snmpd",
-		"zabbix", "prometheus", "rpcbind", "smartdns", "cupsd", "dhclient", "master",
-		"rpc.statd", "titanagent", "node_exporter", "monitor_manage", "dnsmasq",
-	}
-	all := append(defaultExcluded, excludedProcessNames...)
+	all := append(DefaultExcludedProcesses, excludedProcessNames...)
 	for _, name := range all {
 		if strings.Contains(exeName, name) {
 			return true
@@ -1755,15 +2236,15 @@ func updatePerformanceStats(operation string, duration time.Duration) {
 	defer performanceStats.Unlock()
 
 	switch operation {
-	case "port_scan":
+	case OpPortScan:
 		performanceStats.stats.PortScans++
-	case "process_scan":
+	case OpProcessScan:
 		performanceStats.stats.ProcessScans++
-	case "cache_hit":
+	case OpCacheHit:
 		performanceStats.stats.CacheHits++
-	case "cache_miss":
+	case OpCacheMiss:
 		performanceStats.stats.CacheMisses++
-	case "panic_recovery":
+	case OpPanicRecovery:
 		performanceStats.stats.PanicRecoveries++
 	}
 
@@ -1802,11 +2283,11 @@ func GetPerformanceStats() PerformanceStats {
 // recoverFromPanic 从panic中恢复并记录错误信息
 func recoverFromPanic(operation string, pid int) {
 	if r := recover(); r != nil {
-		log.Printf("[simple_port_process_collector] %s panic恢复: pid=%d, error=%v", operation, pid, r)
+		log.Printf("%s %s panic恢复: pid=%d, error=%v", LogPrefix, operation, pid, r)
 
 		// 更新性能统计（在锁外执行，避免锁嵌套）
 		go func() {
-			updatePerformanceStats("panic_recovery", 0)
+			updatePerformanceStats(OpPanicRecovery, 0)
 		}()
 
 		// 根据操作类型设置相应的错误状态
@@ -2034,13 +2515,8 @@ func cleanProcessCaches(activePidKeys map[string]bool) {
 	// 计算需要删除的PID（锁外操作）
 	pidsToDelete := makeSliceWithCapacity[int](len(pidSnapshot))
 	for pid, startTime := range pidSnapshot {
-		// 使用strings.Builder提高字符串拼接效率
-		var builder strings.Builder
-		builder.Grow(DefaultStringBuilderCapacity) // 预分配容量
-		builder.WriteString(strconv.Itoa(pid))
-		builder.WriteString("_")
-		builder.WriteString(startTime)
-		key := builder.String()
+		// 使用字符串工具构建PID键
+		key := stringUtils.BuildPidKey(pid, startTime)
 
 		// 双重检查：既检查活跃PID键，也检查进程是否仍然有效
 		if !activePidKeys[key] || !isProcessValid(pid) {
@@ -2118,13 +2594,8 @@ func cleanStatusCaches(activePorts map[int]bool, activePidKeys map[string]bool) 
 	// 计算需要删除的PID（锁外操作）
 	pidsToDelete := makeSliceWithCapacity[int](len(pidSnapshot))
 	for pid, startTime := range pidSnapshot {
-		// 使用strings.Builder提高字符串拼接效率
-		var builder strings.Builder
-		builder.Grow(DefaultStringBuilderCapacity) // 预分配容量
-		builder.WriteString(strconv.Itoa(pid))
-		builder.WriteString("_")
-		builder.WriteString(startTime)
-		key := builder.String()
+		// 使用字符串工具构建PID键
+		key := stringUtils.BuildPidKey(pid, startTime)
 
 		if !activePidKeys[key] {
 			pidsToDelete = append(pidsToDelete, pid)
@@ -2199,13 +2670,8 @@ func getPidKey(pid int) string {
 	pidStartTimeCache.RLock()
 	if startTime, exists := pidStartTimeCache.cache[pid]; exists {
 		pidStartTimeCache.RUnlock()
-		// 使用strings.Builder提高字符串拼接效率
-		var builder strings.Builder
-		builder.Grow(DefaultStringBuilderCapacity) // 预分配容量
-		builder.WriteString(strconv.Itoa(pid))
-		builder.WriteString("_")
-		builder.WriteString(startTime)
-		return builder.String()
+		// 使用字符串工具构建PID键
+		return stringUtils.BuildPidKey(pid, startTime)
 	}
 	pidStartTimeCache.RUnlock()
 
@@ -2214,13 +2680,8 @@ func getPidKey(pid int) string {
 	pidStartTimeCache.cache[pid] = startTime
 	pidStartTimeCache.Unlock()
 
-	// 使用strings.Builder提高字符串拼接效率
-	var builder strings.Builder
-	builder.Grow(len(startTime) + 10) // 预分配容量
-	builder.WriteString(strconv.Itoa(pid))
-	builder.WriteString("_")
-	builder.WriteString(startTime)
-	return builder.String()
+	// 使用字符串工具构建PID键
+	return stringUtils.BuildPidKey(pid, startTime)
 }
 
 // 字符串缓存结构体，包含缓存映射和访问时间戳
@@ -2238,13 +2699,8 @@ var stringCache = struct {
 // 该函数使用带时间戳的缓存机制，记录每次访问时间
 // 用于后续的基于时间戳的缓存清理策略
 func getProcessIdentityKey(processName, exePath string) string {
-	// 使用strings.Builder提高字符串拼接效率
-	var builder strings.Builder
-	builder.Grow(DefaultStringBuilderCapacity) // 预分配容量
-	builder.WriteString(processName)
-	builder.WriteString("|")
-	builder.WriteString(exePath)
-	key := builder.String()
+	// 使用字符串工具构建进程键
+	key := stringUtils.BuildProcessKey(processName, exePath)
 
 	stringCache.Lock()
 	defer stringCache.Unlock()
@@ -2252,14 +2708,14 @@ func getProcessIdentityKey(processName, exePath string) string {
 	if cached, exists := stringCache.cache[key]; exists {
 		// 更新访问时间戳
 		stringCache.accessTime[key] = time.Now()
-		updatePerformanceStats("cache_hit", 0)
+		updatePerformanceStats(OpCacheHit, 0)
 		return cached
 	}
 
 	// 缓存未命中，创建新字符串并缓存
 	stringCache.cache[key] = key
 	stringCache.accessTime[key] = time.Now()
-	updatePerformanceStats("cache_miss", 0)
+	updatePerformanceStats(OpCacheMiss, 0)
 	return key
 }
 
@@ -2510,7 +2966,7 @@ func getDetailedProcessStatus(pid int) ProcessStatus {
 	startTime := fields[21]
 
 	alive := 1
-	if state == "Z" {
+	if state == ProcessStateZombie {
 		alive = 0
 	}
 
@@ -2691,7 +3147,7 @@ func getProcessDetailedStatusData(pid int) *ProcessDetailedStatus {
 	// 获取基础状态信息
 	statusData, err := getProcessStatusData(pid)
 	if err != nil {
-		log.Printf("[simple_port_process_collector] 获取进程状态失败: pid=%d, error=%v", pid, err)
+		log.Printf("%s 获取进程状态失败: pid=%d, error=%v", LogPrefix, pid, err)
 		// 返回默认状态而不是静默忽略错误
 		return &ProcessDetailedStatus{
 			CPUPercent:     0,
@@ -2718,7 +3174,7 @@ func getProcessDetailedStatusData(pid int) *ProcessDetailedStatus {
 	// 获取CPU和缺页信息
 	utime, stime, minflt, majflt, err := getProcessCPUAndFaults(pid)
 	if err != nil {
-		log.Printf("[simple_port_process_collector] 获取进程CPU信息失败: pid=%d, error=%v", pid, err)
+		log.Printf("%s 获取进程CPU信息失败: pid=%d, error=%v", LogPrefix, pid, err)
 		// 容错：CPU读取失败则按0处理，避免中断其余指标
 		utime, stime, minflt, majflt = 0, 0, 0, 0
 	}
@@ -2726,7 +3182,7 @@ func getProcessDetailedStatusData(pid int) *ProcessDetailedStatus {
 	// 获取IO数据
 	readBytes, writeBytes, err := getProcessIOStats(pid)
 	if err != nil {
-		log.Printf("[simple_port_process_collector] 获取进程IO信息失败: pid=%d, error=%v", pid, err)
+		log.Printf("%s 获取进程IO信息失败: pid=%d, error=%v", LogPrefix, pid, err)
 		// 容错：很多系统对 /proc/<pid>/io 有权限限制，读不到时置0但不影响其他指标
 		readBytes, writeBytes = 0, 0
 	}
@@ -2734,8 +3190,8 @@ func getProcessDetailedStatusData(pid int) *ProcessDetailedStatus {
 	// 获取内存总量
 	memTotal, err := getSystemMemTotal()
 	if err != nil {
-		log.Printf("[simple_port_process_collector] 获取系统内存总量失败: %v", err)
-		memTotal = 1024 * 1024 // 使用1GB作为默认值，防止除零
+		log.Printf("%s 获取系统内存总量失败: %v", LogPrefix, err)
+		memTotal = DefaultMemTotalKB // 使用默认值，防止除零
 	}
 
 	// 计算增量值
@@ -2764,9 +3220,9 @@ func getProcessDetailedStatusData(pid int) *ProcessDetailedStatus {
 	}
 
 	// 静态指标（优先从 /proc/[pid]/status 读取）
-	vmrss := parseProcessStatusValue(statusData["vmrss"])
-	vmsize := parseProcessStatusValue(statusData["vmsize"])
-	threads := parseProcessStatusValue(statusData["threads"])
+	vmrss := parseProcessStatusValue(statusData[StatusFieldVmrss])
+	vmsize := parseProcessStatusValue(statusData[StatusFieldVmsize])
+	threads := parseProcessStatusValue(statusData[StatusFieldThreads])
 
 	// 兜底：若从 status 读取失败或值为 0，尝试从 /proc/[pid]/stat 计算
 	if vmrss == 0 || vmsize == 0 || threads == 0 {
@@ -2783,13 +3239,16 @@ func getProcessDetailedStatusData(pid int) *ProcessDetailedStatus {
 			}
 		}
 	}
-	voluntary := parseProcessStatusValue(statusData["voluntary_ctxt_switches"])
-	nonvoluntary := parseProcessStatusValue(statusData["nonvoluntary_ctxt_switches"])
+	voluntary := parseProcessStatusValue(statusData[StatusFieldVoluntaryCtxtSwitches])
+	nonvoluntary := parseProcessStatusValue(statusData[StatusFieldNonvoluntaryCtxtSwitches])
 
-	// 安全计算内存百分比，防止除零
+	// 安全计算内存百分比，防止除零错误
 	var memPercent float64
 	if memTotal > 0 {
 		memPercent = vmrss / memTotal * 100
+	} else {
+		// 如果内存总量为0或无效，使用默认值计算
+		memPercent = vmrss / DefaultMemTotalKB * 100
 	}
 
 	return &ProcessDetailedStatus{
@@ -2858,14 +3317,14 @@ func getProcessStatFallback(pid int) (float64, float64, float64, error) {
 
 // 从/proc/[pid]/status获取状态信息
 func getProcessStatusData(pid int) (map[string]string, error) {
-	statusFile := procPath(fmt.Sprintf("/proc/%d/status", pid))
-	file, err := os.Open(statusFile)
+	statusPath := stringUtils.BuildPath(ProcPathPrefix, strconv.Itoa(pid), ProcStatusSuffix)
+	file, err := os.Open(procPath(statusPath))
 	if err != nil {
 		return nil, fmt.Errorf("failed to open status file for pid %d: %w", pid, err)
 	}
 	defer func() {
 		if closeErr := file.Close(); closeErr != nil {
-			log.Printf("[simple_port_process_collector] failed to close status file for pid %d: %v", pid, closeErr)
+			log.Printf("%s failed to close status file for pid %d: %v", LogPrefix, pid, closeErr)
 		}
 	}()
 
@@ -2873,7 +3332,7 @@ func getProcessStatusData(pid int) (map[string]string, error) {
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
-		parts := strings.SplitN(line, ":", 2)
+		parts := strings.SplitN(line, ColonSeparator, 2)
 		if len(parts) < 2 {
 			continue
 		}
@@ -2928,7 +3387,8 @@ func getProcessCPUAndFaults(pid int) (float64, float64, float64, float64, error)
 
 // 从/proc/[pid]/io获取IO数据
 func getProcessIOStats(pid int) (float64, float64, error) {
-	content, err := os.ReadFile(procPath(fmt.Sprintf("/proc/%d/io", pid)))
+	ioPath := stringUtils.BuildPath(ProcPathPrefix, strconv.Itoa(pid), ProcIOSuffix)
+	content, err := os.ReadFile(procPath(ioPath))
 	if err != nil {
 		return 0, 0, err
 	}
@@ -2937,11 +3397,11 @@ func getProcessIOStats(pid int) (float64, float64, error) {
 	scanner := bufio.NewScanner(strings.NewReader(string(content)))
 	for scanner.Scan() {
 		line := scanner.Text()
-		if strings.HasPrefix(line, "read_bytes:") {
-			fmt.Sscanf(line, "read_bytes: %f", &readBytes)
+		if strings.HasPrefix(line, IOFieldReadBytes) {
+			fmt.Sscanf(line, "%s %f", &readBytes)
 		}
-		if strings.HasPrefix(line, "write_bytes:") {
-			fmt.Sscanf(line, "write_bytes: %f", &writeBytes)
+		if strings.HasPrefix(line, IOFieldWriteBytes) {
+			fmt.Sscanf(line, "%s %f", &writeBytes)
 		}
 	}
 	return readBytes, writeBytes, nil
@@ -2949,26 +3409,39 @@ func getProcessIOStats(pid int) (float64, float64, error) {
 
 // 获取系统内存总量
 func getSystemMemTotal() (float64, error) {
-	content, err := os.ReadFile(procPath("/proc/meminfo"))
+	content, err := os.ReadFile(procPath(ProcMemInfoPath))
 	if err != nil {
-		return 0, err
+		return DefaultMemTotalKB, fmt.Errorf("failed to read /proc/meminfo: %w", err)
 	}
 
 	scanner := bufio.NewScanner(strings.NewReader(string(content)))
 	for scanner.Scan() {
-		if strings.HasPrefix(scanner.Text(), "MemTotal:") {
+		if strings.HasPrefix(scanner.Text(), MemInfoFieldMemTotal) {
 			fields := strings.Fields(scanner.Text())
 			if len(fields) >= 2 {
-				return strconv.ParseFloat(fields[1], 64)
+				memTotal, err := strconv.ParseFloat(fields[1], 64)
+				if err != nil {
+					return DefaultMemTotalKB, fmt.Errorf("failed to parse MemTotal: %w", err)
+				}
+				// 防止除零错误，确保内存总量至少为默认值
+				if memTotal <= 0 {
+					return DefaultMemTotalKB, fmt.Errorf("invalid MemTotal value: %f", memTotal)
+				}
+				return memTotal, nil
 			}
 		}
 	}
-	return 0, fmt.Errorf("MemTotal not found")
+
+	if err := scanner.Err(); err != nil {
+		return DefaultMemTotalKB, fmt.Errorf("failed to scan /proc/meminfo: %w", err)
+	}
+
+	return DefaultMemTotalKB, fmt.Errorf("MemTotal not found in /proc/meminfo")
 }
 
 // 辅助函数：转换状态值，支持带单位（如 '25592 kB'）
 func parseProcessStatusValue(value string) float64 {
-	if value == "" {
+	if value == EmptyString {
 		return 0
 	}
 	// 只取第一个数字部分
