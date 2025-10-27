@@ -1884,7 +1884,7 @@ func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTi
 			found = true
 			// 可选：记录成功的连接（仅在调试模式下）
 			if EnablePortCheckDebugLog {
-				log.Printf("%s 端口 %d 在地址 %s 检测成功，响应时间: %.3f秒", LogPrefix, port, ip, cost)
+				log.Printf("%s 端口 %d 在地址 %s 检测成功，响应时间: %.9f秒", LogPrefix, port, ip, cost)
 			}
 		} else {
 			// 记录失败的地址
@@ -1898,7 +1898,7 @@ func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTi
 
 	// 如果是第一个成功的地址，记录最终使用的响应时间
 	if found && bestIP != "" && EnablePortCheckDebugLog {
-		log.Printf("%s 端口 %d 最终使用地址 %s 的响应时间: %.6f秒 (%.3f秒)", LogPrefix, port, bestIP, minResp, minResp)
+		log.Printf("%s 端口 %d 最终使用地址 %s 的响应时间: %.9f秒 (指标值)", LogPrefix, port, bestIP, minResp)
 	}
 
 	// 如果常用地址检测成功，直接返回结果
@@ -1982,7 +1982,7 @@ func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTi
 				cost := time.Since(start).Seconds()
 				// 可选：记录成功的连接（仅在调试模式下）
 				if EnablePortCheckDebugLog {
-					log.Printf("%s 端口 %d 在地址 %s 检测成功，响应时间: %.3f秒", LogPrefix, port, ip, cost)
+					log.Printf("%s 端口 %d 在地址 %s 检测成功，响应时间: %.9f秒", LogPrefix, port, ip, cost)
 				}
 				select {
 				case resultOnce <- cost:
