@@ -498,6 +498,9 @@ func (su *StringUtils) BuildPath(parts ...string) string {
 	defer globalStringPool.Put(sb)
 
 	for i, part := range parts {
+		// 清理 part 的开头和结尾的斜杠，避免双斜杠
+		part = strings.Trim(part, PathSeparator)
+
 		if i > 0 && !strings.HasSuffix(sb.String(), PathSeparator) {
 			sb.WriteString(PathSeparator)
 		}
@@ -532,6 +535,9 @@ func (su *StringUtils) BuildPidKey(pid int, startTime string) string {
 func (su *StringUtils) BuildSocketPath(fdPath, fdName string) string {
 	sb := globalStringPool.Get()
 	defer globalStringPool.Put(sb)
+
+	// 清理 fdPath 末尾的斜杠，避免双斜杠
+	fdPath = strings.TrimSuffix(fdPath, PathSeparator)
 
 	sb.WriteString(fdPath)
 	sb.WriteString(PathSeparator)
@@ -612,6 +618,23 @@ func procPath(path string) string {
 		return path
 	}
 	return stringUtils.BuildPath(procPrefix, path)
+}
+
+// procPathNoPrefix 辅助函数：对于已经包含完整路径的情况，智能处理
+// 用于避免对已完整路径重复添加前缀导致的双斜杠问题
+func procPathNoPrefix(path string) string {
+	// 如果路径已经以 /proc 开头，说明已经是完整路径
+	// 直接使用 procPrefix 处理即可
+	if strings.HasPrefix(path, ProcPathPrefix) {
+		if procPrefix == EmptyString {
+			return path
+		}
+		// 移除开头的 /proc，然后添加 procPrefix
+		relativePath := strings.TrimPrefix(path, ProcPathPrefix)
+		return stringUtils.BuildPath(procPrefix, relativePath)
+	}
+	// 其他情况直接返回
+	return path
 }
 
 // ========== 主要收集器结构体 ==========
@@ -1577,7 +1600,7 @@ func discoverPortProcess() []PortProcessInfo {
 	seenTCP := make(map[int]bool) // 用于去重，避免重复处理同一端口
 
 	// 第二步：打开/proc目录，遍历所有进程
-	procHandle, err := NewSafeFileHandle(procPath(ProcPathPrefix))
+	procHandle, err := NewSafeFileHandle(procPathNoPrefix(ProcPathPrefix))
 	if err != nil {
 		log.Printf("%s %s\n", LogPrefix, fmt.Sprintf(ErrMsgFailedToOpenProc, err))
 		return results
@@ -1612,7 +1635,7 @@ func discoverPortProcess() []PortProcessInfo {
 		// 使用字符串工具构建路径
 		fdPath := stringUtils.BuildPath(ProcPathPrefix, entry.Name(), ProcFdSuffix)
 
-		fdHandle, err := NewSafeFileHandle(procPath(fdPath))
+		fdHandle, err := NewSafeFileHandle(procPathNoPrefix(fdPath))
 		if err != nil {
 			log.Printf("%s %s\n", LogPrefix, fmt.Sprintf(ErrMsgFailedToReadFile, fdPath, err))
 			continue
@@ -1629,6 +1652,8 @@ func discoverPortProcess() []PortProcessInfo {
 		for _, fdEntry := range fds {
 			// 使用字符串工具构建socket路径
 			fdLink := stringUtils.BuildSocketPath(fdPath, fdEntry.Name())
+			// 处理完整路径，避免双斜杠问题
+			fdLink = procPathNoPrefix(fdLink)
 
 			link, err := os.Readlink(fdLink)
 			if err != nil {
@@ -1689,7 +1714,7 @@ func parseInodePortMap(files []string, proto string) map[string]int {
 	// 遍历所有网络连接表文件
 	for _, file := range files {
 		// 读取网络连接表文件内容
-		content, err := os.ReadFile(procPath(file))
+		content, err := os.ReadFile(procPathNoPrefix(file))
 		if err != nil {
 			log.Printf("[simple_port_process_collector] failed to read %s: %v\n", file, err)
 			continue
@@ -2054,14 +2079,14 @@ func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTi
 // isProcessValid 检查进程是否仍然有效（快速检查）
 func isProcessValid(pid int) bool {
 	statPath := stringUtils.BuildPath(ProcPathPrefix, strconv.Itoa(pid), ProcStatSuffix)
-	_, err := os.Stat(procPath(statPath))
+	_, err := os.Stat(procPathNoPrefix(statPath))
 	return err == nil
 }
 
 // getProcStatFields 安全解析 /proc/[pid]/stat，兼容 comm 字段含空格/括号
 func getProcStatFields(pid int) ([]string, error) {
 	statPath := stringUtils.BuildPath(ProcPathPrefix, strconv.Itoa(pid), ProcStatSuffix)
-    content, err := os.ReadFile(procPath(statPath))
+    content, err := os.ReadFile(procPathNoPrefix(statPath))
     if err != nil {
         return nil, err
     }
@@ -2120,7 +2145,7 @@ func checkProcess(pid int) int {
 // getProcessExe 函数：获取进程的可执行文件路径
 func getProcessExe(pid int) string {
 	exePath := stringUtils.BuildPath(ProcPathPrefix, strconv.Itoa(pid), ProcExeSuffix)
-	path, err := os.Readlink(procPath(exePath))
+	path, err := os.Readlink(procPathNoPrefix(exePath))
 	if err != nil || path == EmptyString {
 		return PathSeparator
 	}
@@ -2130,7 +2155,7 @@ func getProcessExe(pid int) string {
 // getProcessCwd 函数：获取进程的工作目录
 func getProcessCwd(pid int) string {
 	cwdPath := stringUtils.BuildPath(ProcPathPrefix, strconv.Itoa(pid), ProcCwdSuffix)
-	path, err := os.Readlink(procPath(cwdPath))
+	path, err := os.Readlink(procPathNoPrefix(cwdPath))
 	if err != nil || path == EmptyString {
 		return PathSeparator
 	}
@@ -2140,7 +2165,7 @@ func getProcessCwd(pid int) string {
 // getProcessUser 函数：获取进程的运行用户（UID）
 func getProcessUser(pid int) string {
 	statusPath := stringUtils.BuildPath(ProcPathPrefix, strconv.Itoa(pid), ProcStatusSuffix)
-	content, err := os.ReadFile(procPath(statusPath))
+	content, err := os.ReadFile(procPathNoPrefix(statusPath))
 	if err != nil {
 		return PathSeparator
 	}
@@ -2896,7 +2921,7 @@ func findAliveProcessInGroup(processName, exePath string) int {
 	}
 
 	// 如果端口信息中没有找到，再进行全量扫描
-	procDir, err := os.Open(procPath("/proc"))
+	procDir, err := os.Open(procPathNoPrefix("/proc"))
 	if err != nil {
 		log.Printf("[simple_port_process_collector] 无法打开/proc目录: %v", err)
 		return 0
@@ -3347,7 +3372,7 @@ func getProcessStatFallback(pid int) (float64, float64, float64, error) {
 // 从/proc/[pid]/status获取状态信息
 func getProcessStatusData(pid int) (map[string]string, error) {
 	statusPath := stringUtils.BuildPath(ProcPathPrefix, strconv.Itoa(pid), ProcStatusSuffix)
-	file, err := os.Open(procPath(statusPath))
+	file, err := os.Open(procPathNoPrefix(statusPath))
 	if err != nil {
 		return nil, fmt.Errorf("failed to open status file for pid %d: %w", pid, err)
 	}
@@ -3417,7 +3442,7 @@ func getProcessCPUAndFaults(pid int) (float64, float64, float64, float64, error)
 // 从/proc/[pid]/io获取IO数据
 func getProcessIOStats(pid int) (float64, float64, error) {
 	ioPath := stringUtils.BuildPath(ProcPathPrefix, strconv.Itoa(pid), ProcIOSuffix)
-	content, err := os.ReadFile(procPath(ioPath))
+	content, err := os.ReadFile(procPathNoPrefix(ioPath))
 	if err != nil {
 		return 0, 0, err
 	}
@@ -3438,7 +3463,7 @@ func getProcessIOStats(pid int) (float64, float64, error) {
 
 // 获取系统内存总量
 func getSystemMemTotal() (float64, error) {
-	content, err := os.ReadFile(procPath(ProcMemInfoPath))
+	content, err := os.ReadFile(procPathNoPrefix(ProcMemInfoPath))
 	if err != nil {
 		return DefaultMemTotalKB, fmt.Errorf("failed to read /proc/meminfo: %w", err)
 	}
