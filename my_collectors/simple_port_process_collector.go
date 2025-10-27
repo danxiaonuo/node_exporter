@@ -1647,14 +1647,14 @@ func discoverPortProcess() []PortProcessInfo {
 
 		fdHandle, err := NewSafeFileHandle(procPathNoPrefix(fdPath))
 		if err != nil {
-			log.Printf("%s %s\n", LogPrefix, fmt.Sprintf(ErrMsgFailedToReadFile, fdPath, err))
+			// 进程可能已退出（竞态条件），静默处理
 			continue
 		}
 
 		fds, err := fdHandle.ReadDir()
 		fdHandle.Close() // 立即关闭文件句柄
 		if err != nil {
-			log.Printf("%s %s\n", LogPrefix, fmt.Sprintf(ErrMsgFailedToReadFile, fdPath, err))
+			// 进程可能已退出（竞态条件），静默处理
 			continue
 		}
 
@@ -1667,7 +1667,7 @@ func discoverPortProcess() []PortProcessInfo {
 
 			link, err := os.Readlink(fdLink)
 			if err != nil {
-				log.Printf("%s %s\n", LogPrefix, fmt.Sprintf(ErrMsgFailedToReadlink, fdLink, err))
+				// 文件描述符可能已被关闭或进程已退出（竞态条件），静默处理
 				continue
 			}
 
@@ -2007,8 +2007,10 @@ func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTi
 	addrs = finalAddrs
 
 	if len(addrs) == 0 {
-		// 记录所有常用地址都失败的情况
-		log.Printf("%s 端口 %d 检测失败: 常用地址 %v 均不可达", LogPrefix, port, failedAddrs)
+		// 记录所有常用地址都失败的情况（仅在调试模式下）
+		if EnablePortCheckDebugLog {
+			log.Printf("%s 端口 %d 检测失败: 常用地址 %v 均不可达", LogPrefix, port, failedAddrs)
+		}
 		return 0, 0
 	}
 
@@ -2080,8 +2082,10 @@ func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTi
 			}
 		}
 	logFailure:
-		// 记录所有地址都失败的情况
-		log.Printf("%s 端口 %d 检测失败: 常用地址 %v 和本地IP %v 均不可达", LogPrefix, port, failedAddrs, addrs)
+		// 记录所有地址都失败的情况（仅在调试模式下）
+		if EnablePortCheckDebugLog {
+			log.Printf("%s 端口 %d 检测失败: 常用地址 %v 和本地IP %v 均不可达", LogPrefix, port, failedAddrs, addrs)
+		}
 		return 0, 0
 	}
 }
