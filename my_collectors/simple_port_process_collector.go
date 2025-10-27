@@ -554,7 +554,7 @@ var EnablePortCheckDebugLog = func() bool {
 			return enabled
 		}
 	}
-	return false // 默认禁用调试日志
+	return true // 默认禁用调试日志
 }()
 
 // EnableHostIPDetection 是否启用宿主机IP检测
@@ -812,6 +812,11 @@ func processTCPDetectionQueue() {
 				alive, respTime = checkPortTCP(p)
 			}
 
+			// 记录检测结果
+			if EnablePortCheckDebugLog {
+				log.Printf("%s 端口 %d 检测完成: alive=%d, respTime=%.9f秒", PortProcessLogPrefix, p, alive, respTime)
+			}
+
 			// 原子更新端口状态缓存
 			updatePortStatusCache(p, alive, respTime)
 
@@ -847,6 +852,13 @@ func updatePortStatusCache(port int, alive int, respTime float64) {
 	portStatusCache.RWMutex.Lock()
 	defer portStatusCache.RWMutex.Unlock()
 
+	// 记录更新前的值，用于调试
+	if EnablePortCheckDebugLog {
+		oldRespTime := portStatusCache.ResponseTime[port]
+		log.Printf("%s 端口 %d 缓存更新: alive=%d, 旧响应时间=%.9f秒, 新响应时间=%.9f秒",
+			LogPrefix, port, alive, oldRespTime, respTime)
+	}
+
 	portStatusCache.Status[port] = alive
 	// 如果端口挂了，响应时间设为0
 	if alive == 0 {
@@ -855,6 +867,12 @@ func updatePortStatusCache(port int, alive int, respTime float64) {
 		portStatusCache.ResponseTime[port] = respTime
 	}
 	portStatusCache.LastCheck[port] = time.Now()
+
+	// 记录更新后的值，用于验证
+	if EnablePortCheckDebugLog {
+		log.Printf("%s 端口 %d 缓存已更新: 当前响应时间=%.9f秒",
+			LogPrefix, port, portStatusCache.ResponseTime[port])
+	}
 }
 
 // startProcessDetectionWorker 进程检测异步处理器
@@ -1901,7 +1919,7 @@ func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTi
 
 	// 如果是第一个成功的地址，记录最终使用的响应时间
 	if found && bestIP != "" && EnablePortCheckDebugLog {
-		log.Printf("%s 端口 %d 最终使用地址 %s 的响应时间: %.9f秒 (指标值)", LogPrefix, port, bestIP, minResp)
+		log.Printf("%s 端口 %d 最终使用地址 %s 的响应时间: %.9f秒 (指标值), 实际返回: %.9f秒", LogPrefix, port, bestIP, minResp, minResp)
 	}
 
 	// 如果常用地址检测成功，直接返回结果
