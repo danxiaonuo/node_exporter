@@ -554,7 +554,7 @@ var EnablePortCheckDebugLog = func() bool {
 			return enabled
 		}
 	}
-	return false // 默认禁用调试日志
+	return true // 默认禁用调试日志
 }()
 
 // EnableHostIPDetection 是否启用宿主机IP检测
@@ -1870,6 +1870,7 @@ func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTi
 	var failedAddrs []string // 记录失败的地址
 
 	// 第一步：检测常用地址，这些地址通常响应最快
+	var bestIP string
 	for _, ip := range commonAddrs {
 		start := time.Now()
 		conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, strconv.Itoa(port)), timeout)
@@ -1878,6 +1879,7 @@ func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTi
 			conn.Close()
 			if minResp < 0 || cost < minResp {
 				minResp = cost
+				bestIP = ip
 			}
 			found = true
 			// 可选：记录成功的连接（仅在调试模式下）
@@ -1892,6 +1894,11 @@ func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTi
 				log.Printf("%s 端口 %d 在地址 %s 检测失败: %v", LogPrefix, port, ip, err)
 			}
 		}
+	}
+
+	// 如果是第一个成功的地址，记录最终使用的响应时间
+	if found && bestIP != "" && EnablePortCheckDebugLog {
+		log.Printf("%s 端口 %d 最终使用地址 %s 的响应时间: %.6f秒 (%.3f秒)", LogPrefix, port, bestIP, minResp, minResp)
 	}
 
 	// 如果常用地址检测成功，直接返回结果
