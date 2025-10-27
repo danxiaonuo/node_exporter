@@ -498,13 +498,23 @@ func (su *StringUtils) BuildPath(parts ...string) string {
 	defer globalStringPool.Put(sb)
 
 	for i, part := range parts {
-		// 清理 part 的开头和结尾的斜杠，避免双斜杠
-		part = strings.Trim(part, PathSeparator)
-
-		if i > 0 && !strings.HasSuffix(sb.String(), PathSeparator) {
-			sb.WriteString(PathSeparator)
+		if i == 0 {
+			// 第一个部分：去除结尾的斜杠，去除开头的斜杠（规范化处理）
+			part = strings.TrimRight(part, PathSeparator)
+			part = strings.TrimLeft(part, PathSeparator)
+			// 总是以斜杠开头
+			if len(part) > 0 {
+				sb.WriteString(PathSeparator)
+				sb.WriteString(part)
+			}
+		} else {
+			// 后续部分：去除开头的斜杠，避免双斜杠
+			part = strings.TrimLeft(part, PathSeparator)
+			if len(part) > 0 {
+				sb.WriteString(PathSeparator)
+				sb.WriteString(part)
+			}
 		}
-		sb.WriteString(part)
 	}
 	return sb.String()
 }
