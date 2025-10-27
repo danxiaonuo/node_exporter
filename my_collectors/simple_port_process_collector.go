@@ -814,7 +814,7 @@ func processTCPDetectionQueue() {
 
 			// 记录检测结果
 			if EnablePortCheckDebugLog {
-				log.Printf("%s 端口 %d 检测完成: alive=%d, respTime=%.9f秒", PortProcessLogPrefix, p, alive, respTime)
+				log.Printf("%s 端口 %d 检测完成: alive=%d, respTime=%.9e", PortProcessLogPrefix, p, alive, respTime)
 			}
 
 			// 原子更新端口状态缓存
@@ -855,7 +855,7 @@ func updatePortStatusCache(port int, alive int, respTime float64) {
 	// 记录更新前的值，用于调试
 	if EnablePortCheckDebugLog {
 		oldRespTime := portStatusCache.ResponseTime[port]
-		log.Printf("%s 端口 %d 缓存更新: alive=%d, 旧响应时间=%.9f秒, 新响应时间=%.9f秒",
+		log.Printf("%s 端口 %d 缓存更新: alive=%d, 旧响应时间=%.9e, 新响应时间=%.9e",
 			LogPrefix, port, alive, oldRespTime, respTime)
 	}
 
@@ -870,7 +870,7 @@ func updatePortStatusCache(port int, alive int, respTime float64) {
 
 	// 记录更新后的值，用于验证
 	if EnablePortCheckDebugLog {
-		log.Printf("%s 端口 %d 缓存已更新: 当前响应时间=%.9f秒",
+		log.Printf("%s 端口 %d 缓存已更新: 当前响应时间=%.9e",
 			LogPrefix, port, portStatusCache.ResponseTime[port])
 	}
 }
@@ -1411,7 +1411,7 @@ func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 					respTime := getPortResponseTime(info.Port)
 					// 总是暴露响应时间指标，端口挂了时为0
 					if EnablePortCheckDebugLog && respTime > 0 {
-						log.Printf("%s 端口 %d 指标暴露使用缓存响应时间: %.9f秒", LogPrefix, info.Port, respTime)
+						log.Printf("%s 端口 %d 指标暴露使用缓存响应时间: %.9e", LogPrefix, info.Port, respTime)
 					}
 					ch <- prometheus.MustNewConstMetric(
 						c.portTCPResponseTimeDesc, prometheus.GaugeValue, respTime, labels...,
@@ -1905,7 +1905,7 @@ func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTi
 			found = true
 			// 可选：记录成功的连接（仅在调试模式下）
 			if EnablePortCheckDebugLog {
-				log.Printf("%s 端口 %d 在地址 %s 检测成功，响应时间: %.9f秒", LogPrefix, port, ip, cost)
+				log.Printf("%s 端口 %d 在地址 %s 检测成功，响应时间: %.9e", LogPrefix, port, ip, cost)
 			}
 		} else {
 			// 记录失败的地址
@@ -1917,9 +1917,10 @@ func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTi
 		}
 	}
 
-	// 如果是第一个成功的地址，记录最终使用的响应时间
+	// 记录最终使用的响应时间
+	// 注: Prometheus指标使用科学计数法, 例如 4.2064e-05 = 0.000042064秒
 	if found && bestIP != "" && EnablePortCheckDebugLog {
-		log.Printf("%s 端口 %d 最终使用地址 %s 的响应时间: %.9f秒 (指标值), 实际返回: %.9f秒", LogPrefix, port, bestIP, minResp, minResp)
+		log.Printf("%s 端口 %d 最终使用地址 %s 的响应时间: %.9e (指标值)", LogPrefix, port, bestIP, minResp)
 	}
 
 	// 如果常用地址检测成功，直接返回结果
@@ -2003,7 +2004,7 @@ func checkPortTCPWithTimeout(port int, timeout time.Duration) (alive int, respTi
 				cost := time.Since(start).Seconds()
 				// 可选：记录成功的连接（仅在调试模式下）
 				if EnablePortCheckDebugLog {
-					log.Printf("%s 端口 %d 在地址 %s 检测成功，响应时间: %.9f秒", LogPrefix, port, ip, cost)
+					log.Printf("%s 端口 %d 在地址 %s 检测成功，响应时间: %.9e", LogPrefix, port, ip, cost)
 				}
 				select {
 				case resultOnce <- cost:
