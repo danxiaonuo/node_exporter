@@ -554,7 +554,7 @@ var EnablePortCheckDebugLog = func() bool {
 			return enabled
 		}
 	}
-	return true // 默认禁用调试日志
+	return false // 默认禁用调试日志
 }()
 
 // EnableHostIPDetection 是否启用宿主机IP检测
