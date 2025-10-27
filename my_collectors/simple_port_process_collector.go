@@ -546,7 +546,7 @@ var stringUtils = &StringUtils{}
 // 这些变量支持通过环境变量进行配置，提供运行时灵活性
 
 // EnablePortCheckDebugLog 是否启用端口检测调试日志
-// 通过环境变量 DEBUG_PORT_CHECK 控制，默认为 true
+// 通过环境变量 DEBUG_PORT_CHECK 控制，默认为 false
 var EnablePortCheckDebugLog = func() bool {
 	if v := os.Getenv(EnvDebugPortCheck); v != EmptyString {
 		enabled, err := strconv.ParseBool(v)
@@ -554,7 +554,7 @@ var EnablePortCheckDebugLog = func() bool {
 			return enabled
 		}
 	}
-	return true // 默认启用调试日志
+	return false // 默认禁用调试日志
 }()
 
 // EnableHostIPDetection 是否启用宿主机IP检测
