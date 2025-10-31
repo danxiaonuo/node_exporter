@@ -3001,8 +3001,8 @@ func getDetailedProcessStatus(pid int) ProcessStatus {
 	now := time.Now()
 	if status, exists := processStatusCache.cache[pid]; exists {
 		if lastCheck, hasCheck := processStatusCache.lastCheck[pid]; hasCheck {
-			// 如果缓存未过期（5秒内），直接返回缓存结果
-			if now.Sub(lastCheck) < 5*time.Second {
+			// 使用配置的进程存活状态检测间隔
+			if now.Sub(lastCheck) < processAliveStatusInterval {
 				processStatusCache.RUnlock()
 				return status
 			}
