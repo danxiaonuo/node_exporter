@@ -965,6 +965,50 @@ func processProcessDetectionQueue() {
 			// 原子更新进程存活状态缓存
 			updateProcessAliveCache(key, status)
 
+			// 同时更新进程详细状态缓存（包含State和StartTime）
+			// 读取完整的进程状态信息
+			fields, err := getProcStatFields(p)
+			if err != nil || len(fields) < 22 {
+				// 读取失败，使用已检测的存活状态
+				processStatusCache.Lock()
+				if cachedStatus, exists := processStatusCache.cache[p]; exists {
+					// 只更新Alive字段，保留其他字段
+					cachedStatus.Alive = status
+					processStatusCache.cache[p] = cachedStatus
+				} else {
+					// 创建默认状态
+					processStatusCache.cache[p] = ProcessStatus{
+						Pid:       p,
+						Alive:     status,
+						State:     "X",
+						StartTime: "0",
+					}
+				}
+				processStatusCache.lastCheck[p] = time.Now()
+				processStatusCache.Unlock()
+				return
+			}
+
+			// 解析进程状态信息
+			state := fields[2]
+			startTime := fields[21]
+
+			alive := 1
+			if state == ProcessStateZombie {
+				alive = 0
+			}
+
+			// 更新进程详细状态缓存
+			processStatusCache.Lock()
+			processStatusCache.cache[p] = ProcessStatus{
+				Pid:       p,
+				Alive:     alive,
+				State:     state,
+				StartTime: startTime,
+			}
+			processStatusCache.lastCheck[p] = time.Now()
+			processStatusCache.Unlock()
+
 		}(pid)
 	}
 	wg.Wait() // 等待所有检测任务完成
@@ -1440,8 +1484,10 @@ func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 						c.portTCPAliveDesc, prometheus.GaugeValue, float64(alive), labels...,
 					)
 
-					// 生成TCP端口响应时间指标（端口挂了时响应时间为0）
-					respTime := getPortResponseTime(info.Port)
+				// 生成TCP端口响应时间指标（端口挂了时响应时间为0）
+				respTime := getPortResponseTime(info.Port)
+				// 检查响应时间是否有效（>=0），避免暴露-1（未知状态）
+				if respTime >= 0 {
 					// 总是暴露响应时间指标，端口挂了时为0
 					if EnablePortCheckDebugLog && respTime > 0 {
 						log.Printf("%s 端口 %d 指标暴露使用缓存响应时间: %.5e", LogPrefix, info.Port, respTime)
@@ -1450,9 +1496,10 @@ func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 						c.portTCPResponseTimeDesc, prometheus.GaugeValue, respTime, labels...,
 					)
 				}
-				tcpPortDone[info.Port] = true
 			}
+			tcpPortDone[info.Port] = true
 		}
+	}
 
 		// 只对有端口监听的进程进行分组累计
 		if enableProcessAggregation && shouldAggregateProcess(info.ProcessName) {
@@ -2858,8 +2905,9 @@ func getProcessIdentityStatus(processName, exePath string) (int, string) {
 				IsAlive:     true,
 			}
 			processIdentityCache.Unlock()
-			// 触发端口-进程映射的强制重扫，尽快更新分组里的PID
-			forceRescanPortProcess()
+			// 异步触发端口-进程映射的强制重扫，尽快更新分组里的PID
+			// 使用goroutine避免阻塞，节流机制已在forceRescanPortProcess内部处理
+			go forceRescanPortProcess()
 			return 1, "R" // 进程存活（新发现）
 		}
 		return -1, "X" // 未找到进程
@@ -2869,8 +2917,13 @@ func getProcessIdentityStatus(processName, exePath string) (int, string) {
 	if identity.IsAlive {
 		// 检查当前PID是否仍然有效
 		status := getDetailedProcessStatus(identity.CurrentPid)
+		// 与端口状态保持一致：Alive >= 0 才处理，-1表示未知状态，等待异步检测
 		if status.Alive == 1 {
 			return 1, status.State // 进程存活
+		} else if status.Alive < 0 {
+			// Alive为-1，表示未知状态，等待异步检测完成，不暴露指标
+			// 暂时返回上次已知状态（如果identity.IsAlive为true，说明之前是存活的）
+			return 1, "?" // 暂时返回存活，等待异步更新
 		} else {
 			// 当前PID已死，尝试查找同组其他存活进程
 			alivePid := findAliveProcessInGroup(processName, exePath)
@@ -2884,8 +2937,9 @@ func getProcessIdentityStatus(processName, exePath string) (int, string) {
 					processIdentityCache.cache[key] = updatedIdentity
 				}
 				processIdentityCache.Unlock()
-				// 强制重扫端口-进程映射，避免累计仍使用旧PID
-				forceRescanPortProcess()
+				// 异步触发强制重扫端口-进程映射，避免累计仍使用旧PID
+				// 使用goroutine避免阻塞，节流机制已在forceRescanPortProcess内部处理
+				go forceRescanPortProcess()
 				return 1, "R" // 进程存活（使用其他PID）
 			} else {
 				// 所有进程都已死，标记为非存活
@@ -2912,8 +2966,9 @@ func getProcessIdentityStatus(processName, exePath string) (int, string) {
 			processIdentityCache.cache[key] = updatedIdentity
 		}
 		processIdentityCache.Unlock()
-		// 触发强制重扫，以便聚合指标立刻使用新PID
-		forceRescanPortProcess()
+		// 异步触发强制重扫，以便聚合指标立刻使用新PID
+		// 使用goroutine避免阻塞，节流机制已在forceRescanPortProcess内部处理
+		go forceRescanPortProcess()
 		return 1, "R" // 进程存活（重新启动）
 	}
 
@@ -2995,7 +3050,7 @@ type ProcessStatus struct {
 	Pid       int    `json:"pid"`
 }
 
-// getDetailedProcessStatus 获取进程详细状态信息（带缓存）
+// getDetailedProcessStatus 获取进程详细状态信息（带缓存，异步更新）
 func getDetailedProcessStatus(pid int) ProcessStatus {
 	processStatusCache.RLock()
 	now := time.Now()
@@ -3007,51 +3062,34 @@ func getDetailedProcessStatus(pid int) ProcessStatus {
 				return status
 			}
 		}
+		// 缓存过期，先获取历史状态
+		lastStatus := status
+		processStatusCache.RUnlock()
+
+		// 加入异步检测队列
+		processDetectionQueue.Lock()
+		processDetectionQueue.pids[pid] = true
+		processDetectionQueue.Unlock()
+
+		// 返回上次检测结果，等待异步更新
+		return lastStatus
 	}
 	processStatusCache.RUnlock()
 
-	// 缓存过期或不存在，重新读取
-    fields, err := getProcStatFields(pid)
-    if err != nil {
-		status := ProcessStatus{Pid: pid, Alive: 0, State: "X"}
-		// 缓存失败结果，避免频繁重试
-		processStatusCache.Lock()
-		processStatusCache.cache[pid] = status
-		processStatusCache.lastCheck[pid] = now
-		processStatusCache.Unlock()
-		return status
-	}
-	if len(fields) < 22 {
-		status := ProcessStatus{Pid: pid, Alive: 0, State: "X"}
-		processStatusCache.Lock()
-		processStatusCache.cache[pid] = status
-		processStatusCache.lastCheck[pid] = now
-		processStatusCache.Unlock()
-		return status
-	}
+	// 没有历史记录，完全异步处理，避免同步IO
+	// 加入异步检测队列，异步更新完整状态
+	processDetectionQueue.Lock()
+	processDetectionQueue.pids[pid] = true
+	processDetectionQueue.Unlock()
 
-	state := fields[2]
-	startTime := fields[21]
-
-	alive := 1
-	if state == ProcessStateZombie {
-		alive = 0
-	}
-
-	status := ProcessStatus{
+	// 返回未知状态（Alive为-1表示不暴露指标，等待异步检测完成）
+	// 与端口状态保持一致：没有历史记录时不暴露指标
+	return ProcessStatus{
 		Pid:       pid,
-		Alive:     alive,
-		State:     state,
-		StartTime: startTime,
+		Alive:     -1, // 使用-1表示暂时不暴露指标，等待异步检测完成
+		State:     "?", // 未知状态
+		StartTime: "0", // 未知启动时间
 	}
-
-	// 更新缓存
-	processStatusCache.Lock()
-	processStatusCache.cache[pid] = status
-	processStatusCache.lastCheck[pid] = now
-	processStatusCache.Unlock()
-
-	return status
 }
 
 // 进程状态检测异步处理器
@@ -3547,58 +3585,46 @@ func getProcessDetailedStatusCached(pid int) *ProcessDetailedStatus {
 		// 没有历史记录，释放读锁
 		processDetailedStatusCache.RUnlock()
 
-		// 没有历史记录，使用原子操作避免竞态条件
-		processDetailedStatusCache.Lock()
-		// 双重检查，避免重复初始化
-		if _, exists := processDetailedStatusCache.cache[pid]; !exists {
-			processDetailedStatusCache.Unlock()
+		// 没有历史记录，加入异步检测队列
+		// 同时创建默认状态（全0）立即返回，因为进程性能指标返回0是合理的
+		// 这样既避免了同步IO，又保证了首次访问有数据返回
+		processStatusDetectionQueue.Lock()
+		processStatusDetectionQueue.pids[pid] = true
+		processStatusDetectionQueue.Unlock()
 
-			// 锁外执行重IO
-			status := getProcessDetailedStatusData(pid)
-
-			// 重新加锁并检查是否已被其他goroutine初始化
-			processDetailedStatusCache.Lock()
-			if _, exists := processDetailedStatusCache.cache[pid]; !exists {
-				if status != nil {
-					processDetailedStatusCache.cache[pid] = status
-					processDetailedStatusCache.lastCheck[pid] = now
-				} else {
-					// 如果获取失败，创建一个默认的状态对象，避免返回nil
-					defaultStatus := &ProcessDetailedStatus{
-						CPUPercent:     0,
-						MinFaultsPerS:  0,
-						MajFaultsPerS:  0,
-						VMRSS:          0,
-						VMSize:         0,
-						MemPercent:     0,
-						KBReadPerS:     0,
-						KBWritePerS:    0,
-						Threads:        0,
-						Voluntary:      0,
-						NonVoluntary:   0,
-						LastUpdate:     now,
-						LastUtime:      0,
-						LastStime:      0,
-						LastMinflt:     0,
-						LastMajflt:     0,
-						LastReadBytes:  0,
-						LastWriteBytes: 0,
-					}
-					processDetailedStatusCache.cache[pid] = defaultStatus
-					processDetailedStatusCache.lastCheck[pid] = now
-				}
-			}
-			processDetailedStatusCache.Unlock()
-		} else {
-			// 如果缓存已存在，释放锁
-			processDetailedStatusCache.Unlock()
+		// 创建默认状态（全0），进程性能可以返回0
+		defaultStatus := &ProcessDetailedStatus{
+			CPUPercent:     0,
+			MinFaultsPerS:  0,
+			MajFaultsPerS:  0,
+			VMRSS:          0,
+			VMSize:         0,
+			MemPercent:     0,
+			KBReadPerS:     0,
+			KBWritePerS:    0,
+			Threads:        0,
+			Voluntary:      0,
+			NonVoluntary:   0,
+			LastUpdate:     now,
+			LastUtime:      0,
+			LastStime:      0,
+			LastMinflt:     0,
+			LastMajflt:     0,
+			LastReadBytes:  0,
+			LastWriteBytes: 0,
 		}
 
-		// 返回刚获取的数据
-		processDetailedStatusCache.RLock()
-		status := processDetailedStatusCache.cache[pid]
-		processDetailedStatusCache.RUnlock()
-		return status
+		// 尝试将默认状态存入缓存（原子操作，避免竞态条件）
+		processDetailedStatusCache.Lock()
+		if _, exists := processDetailedStatusCache.cache[pid]; !exists {
+			// 只有缓存不存在时才写入默认状态，避免覆盖其他goroutine已经写入的真实数据
+			processDetailedStatusCache.cache[pid] = defaultStatus
+			processDetailedStatusCache.lastCheck[pid] = now
+		}
+		processDetailedStatusCache.Unlock()
+
+		// 返回默认状态，异步检测完成后会更新为真实数据
+		return defaultStatus
 	}
 	status := processDetailedStatusCache.cache[pid]
 	processDetailedStatusCache.RUnlock()
