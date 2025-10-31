@@ -1653,9 +1653,34 @@ func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 						// 检查进程是否真的存活（使用快速检查）
 						if identity.IsAlive && identity.CurrentPid > 0 && isProcessValid(identity.CurrentPid) {
 							if checkProcess(identity.CurrentPid) == 1 {
-								// 进程存活，但状态未知（可能是异步检测未完成）
-								aliveValue = 1
-								stateValue = "?"
+								// 进程存活，但状态未知，同步读取真实状态
+								fields, err := getProcStatFields(identity.CurrentPid)
+								if err == nil && len(fields) >= 3 {
+									stateValue = fields[2]
+									aliveValue = 1
+									// 同时更新缓存，避免下次再次同步读取
+									processStatusCache.Lock()
+									startTime := "0"
+									if len(fields) >= 22 {
+										startTime = fields[21]
+									}
+									processStatusCache.cache[identity.CurrentPid] = ProcessStatus{
+										Pid:       identity.CurrentPid,
+										Alive:     1,
+										State:     stateValue,
+										StartTime: startTime,
+									}
+									processStatusCache.lastCheck[identity.CurrentPid] = time.Now()
+									processStatusCache.Unlock()
+									// 将PID加入检测队列，确保后续异步更新
+									processDetectionQueue.Lock()
+									processDetectionQueue.pids[identity.CurrentPid] = true
+									processDetectionQueue.Unlock()
+								} else {
+									// 读取失败，使用默认值
+									aliveValue = 1
+									stateValue = "R" // 假设运行中
+								}
 							} else {
 								// 进程死亡
 								aliveValue = 0
@@ -3075,8 +3100,7 @@ func getProcessIdentityStatus(processName, exePath string) (int, string) {
 			return 1, status.State // 进程存活
 		} else if status.Alive < 0 {
 			// Alive为-1，表示未知状态（没有历史记录或缓存过期，等待异步检测）
-			// 为了提供更好的用户体验，在进程明显不存在时立即返回0，而不是等待异步检测
-			// 但仅在进程文件不存在时才进行快速验证，避免频繁的同步检查
+			// 为了提供更好的用户体验，进行同步检查获取真实状态
 			// 使用最轻量级的检查：仅检查文件是否存在，不读取内容
 			if !isProcessValid(identity.CurrentPid) {
 				// 进程文件不存在，说明进程已死亡
@@ -3105,8 +3129,39 @@ func getProcessIdentityStatus(processName, exePath string) (int, string) {
 				processIdentityCache.Unlock()
 				return 0, "X" // 进程死亡
 			}
-			// 进程文件存在但状态未知，返回-1等待异步检测完成
-			// 这样可以避免阻塞，保持异步机制
+			// 进程文件存在但状态未知，同步读取状态而不是返回未知
+			// 这样可以立即获取真实状态，避免指标显示为"?"
+			// 但仅在必要时同步读取，避免频繁的文件IO
+			fields, err := getProcStatFields(identity.CurrentPid)
+			if err == nil && len(fields) >= 3 {
+				state := fields[2]
+				// 同时更新缓存，避免下次再次同步读取
+				alive := 1
+				if state == ProcessStateZombie {
+					alive = 0
+				}
+				processStatusCache.Lock()
+				startTime := "0"
+				if len(fields) >= 22 {
+					startTime = fields[21]
+				}
+				processStatusCache.cache[identity.CurrentPid] = ProcessStatus{
+					Pid:       identity.CurrentPid,
+					Alive:     alive,
+					State:     state,
+					StartTime: startTime,
+				}
+				// 更新lastCheck时间，标记为已检测
+				// 工作器会在下次处理队列时再次更新，确保60秒间隔的异步更新
+				processStatusCache.lastCheck[identity.CurrentPid] = time.Now()
+				processStatusCache.Unlock()
+				// 将PID加入检测队列，确保后续异步更新（即使已同步读取，也要加入队列以保持60秒间隔更新）
+				processDetectionQueue.Lock()
+				processDetectionQueue.pids[identity.CurrentPid] = true
+				processDetectionQueue.Unlock()
+				return alive, state // 返回真实状态
+			}
+			// 读取失败，返回未知状态
 			return -1, "?" // 未知状态，等待异步检测
 		} else {
 			// 当前PID已死，尝试查找同组其他存活进程
@@ -3250,6 +3305,8 @@ func getDetailedProcessStatus(pid int) ProcessStatus {
 		lastStatus := status
 		processStatusCache.RUnlock()
 
+		// 注意：不要提前更新lastCheck，让工作器在完成检测后更新
+		// 这样可以确保工作器能够及时处理过期缓存
 		// 加入异步检测队列
 		processDetectionQueue.Lock()
 		processDetectionQueue.pids[pid] = true
