@@ -3278,7 +3278,7 @@ func getDetailedProcessStatus(pid int) ProcessStatus {
 
 // 进程状态检测异步处理器
 func startProcessStatusDetectionWorker() {
-	go func() {
+	goroutineManager.StartGoroutine(GoroutineProcessStatusWorker, func() {
 		ticker := time.NewTicker(processStatusInterval)
 		defer ticker.Stop()
 		for {
@@ -3326,7 +3326,7 @@ func startProcessStatusDetectionWorker() {
 				wg.Wait()
 			}
 		}
-	}()
+	})
 }
 
 // startMemoryCleanupWorker 内存清理工作器
@@ -3759,16 +3759,11 @@ func getProcessDetailedStatusCached(pid int) *ProcessDetailedStatus {
 			processDetailedStatusCache.RUnlock()
 
 			// 缓存过期，加入进程状态异步检测队列
+			// 注意：不要提前更新lastCheck，让工作器在完成检测后更新
+			// 这样可以确保工作器能够及时处理过期缓存
 			processStatusDetectionQueue.Lock()
 			processStatusDetectionQueue.pids[pid] = true
 			processStatusDetectionQueue.Unlock()
-
-			// 更新lastCheck时间，避免重复加入队列
-			// 这样可以确保即使Prometheus的scrape_interval很短，也不会频繁加入队列
-			// Worker会在下次执行时更新缓存和lastCheck
-			processDetailedStatusCache.Lock()
-			processDetailedStatusCache.lastCheck[pid] = now
-			processDetailedStatusCache.Unlock()
 
 			// 使用上次检测结果作为临时值
 			return lastStatus
