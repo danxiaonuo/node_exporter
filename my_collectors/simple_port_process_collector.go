@@ -1505,21 +1505,133 @@ func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 		if enableProcessAggregation && shouldAggregateProcess(info.ProcessName) {
 			groupKey := info.ProcessName + "|" + info.ExePath
 			if !reportedGroupKeys[groupKey] {
-				// 使用预分组的进程列表，避免重复计算
-				groupInfos := processGroups[groupKey]
-				aggregatedStatus := calculateProcessGroupAggregation(info.ProcessName, groupInfos)
+			// 使用预分组的进程列表，避免重复计算
+			groupInfos := processGroups[groupKey]
 
-				// 更新进程身份信息（解决服务重启问题）- 智能选择PID
-				if len(groupInfos) > 0 {
-					// 智能选择PID：优先选择存活的进程，确保身份信息准确
-					selectedPid := selectBestPidForIdentity(groupInfos)
-					updateProcessIdentity(info.ProcessName, info.ExePath, selectedPid)
+			// 先更新进程身份信息（解决服务重启问题）- 智能选择PID
+			// 必须在计算性能指标之前更新，确保使用正确的PID
+			if len(groupInfos) > 0 {
+				// 智能选择PID：优先选择存活的进程，确保身份信息准确
+				selectedPid := selectBestPidForIdentity(groupInfos)
+				updateProcessIdentity(info.ProcessName, info.ExePath, selectedPid)
+			}
+
+			// 使用智能进程身份状态检查（解决服务重启问题）
+			// 这会更新进程身份缓存，查找新PID（如果旧PID已死亡）
+			overallAlive, firstAliveState := getProcessIdentityStatus(info.ProcessName, info.ExePath)
+
+			// 计算累计性能指标
+			// 如果groupInfos中的PID都已死亡，但进程身份显示存活，则基于进程身份缓存中的新PID计算
+			var aggregatedStatus *ProcessGroupAggregatedStatus
+			if len(groupInfos) > 0 {
+				// 检查groupInfos中的PID是否都已死亡
+				hasAlivePid := false
+				for _, groupInfo := range groupInfos {
+					if checkProcess(groupInfo.Pid) == 1 {
+						hasAlivePid = true
+						break
+					}
 				}
 
-				// 使用智能进程身份状态检查（解决服务重启问题）
-				overallAlive, firstAliveState := getProcessIdentityStatus(info.ProcessName, info.ExePath)
+				if hasAlivePid {
+					// 有存活的PID，正常计算
+					aggregatedStatus = calculateProcessGroupAggregation(info.ProcessName, groupInfos)
+				} else if overallAlive == 1 {
+					// groupInfos中的PID都已死亡，但进程身份显示存活（找到了新PID）
+					// 基于进程身份缓存中的新PID计算性能指标
+					processIdentityCache.RLock()
+					identity, exists := processIdentityCache.cache[getProcessIdentityKey(info.ProcessName, info.ExePath)]
+					processIdentityCache.RUnlock()
 
-				if overallAlive >= 0 {
+					if exists && identity.IsAlive && identity.CurrentPid > 0 && isProcessValid(identity.CurrentPid) {
+						// 使用进程身份缓存中的新PID计算性能指标
+						tempInfos := []PortProcessInfo{{
+							ProcessName: info.ProcessName,
+							ExePath:     info.ExePath,
+							Pid:         identity.CurrentPid,
+							Port:        0, // 端口未知，但这不影响性能指标计算
+							Protocol:    TCPProtocol,
+						}}
+						aggregatedStatus = calculateProcessGroupAggregation(info.ProcessName, tempInfos)
+					} else {
+						// 无法获取新PID，使用空状态
+						aggregatedStatus = &ProcessGroupAggregatedStatus{
+							ProcessName:     info.ProcessName,
+							ProcessCount:    0,
+							TotalCPUPercent: 0,
+							TotalMemPercent: 0,
+							TotalVMRSS:      0,
+							TotalVMSize:     0,
+							TotalThreads:    0,
+							TotalIORead:     0,
+							TotalIOWrite:    0,
+							LastUpdate:      time.Now(),
+						}
+					}
+				} else {
+					// 所有进程都已死亡，使用空状态
+					aggregatedStatus = &ProcessGroupAggregatedStatus{
+						ProcessName:     info.ProcessName,
+						ProcessCount:    0,
+						TotalCPUPercent: 0,
+						TotalMemPercent: 0,
+						TotalVMRSS:      0,
+						TotalVMSize:     0,
+						TotalThreads:    0,
+						TotalIORead:     0,
+						TotalIOWrite:    0,
+						LastUpdate:      time.Now(),
+					}
+				}
+			} else if overallAlive == 1 {
+				// groupInfos为空，但进程身份显示存活（新PID还没被扫描到）
+				// 基于进程身份缓存中的新PID计算性能指标
+				processIdentityCache.RLock()
+				identity, exists := processIdentityCache.cache[getProcessIdentityKey(info.ProcessName, info.ExePath)]
+				processIdentityCache.RUnlock()
+
+				if exists && identity.IsAlive && identity.CurrentPid > 0 && isProcessValid(identity.CurrentPid) {
+					// 使用进程身份缓存中的新PID计算性能指标
+					tempInfos := []PortProcessInfo{{
+						ProcessName: info.ProcessName,
+						ExePath:     info.ExePath,
+						Pid:         identity.CurrentPid,
+						Port:        0, // 端口未知，但这不影响性能指标计算
+						Protocol:    TCPProtocol,
+					}}
+					aggregatedStatus = calculateProcessGroupAggregation(info.ProcessName, tempInfos)
+				} else {
+					// 无法获取新PID，使用空状态
+					aggregatedStatus = &ProcessGroupAggregatedStatus{
+						ProcessName:     info.ProcessName,
+						ProcessCount:    0,
+						TotalCPUPercent: 0,
+						TotalMemPercent: 0,
+						TotalVMRSS:      0,
+						TotalVMSize:     0,
+						TotalThreads:    0,
+						TotalIORead:     0,
+						TotalIOWrite:    0,
+						LastUpdate:      time.Now(),
+					}
+				}
+			} else {
+				// 进程已死亡，使用空状态
+				aggregatedStatus = &ProcessGroupAggregatedStatus{
+					ProcessName:     info.ProcessName,
+					ProcessCount:    0,
+					TotalCPUPercent: 0,
+					TotalMemPercent: 0,
+					TotalVMRSS:      0,
+					TotalVMSize:     0,
+					TotalThreads:    0,
+					TotalIORead:     0,
+					TotalIOWrite:    0,
+					LastUpdate:      time.Now(),
+				}
+			}
+
+			if overallAlive >= 0 {
 					// 进程存活状态（累计）- 使用智能身份管理
 					// 生成进程存活状态指标（累计）- 使用智能身份管理
 					ch <- prometheus.MustNewConstMetric(
