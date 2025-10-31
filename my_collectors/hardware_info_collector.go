@@ -3,6 +3,7 @@ package my_collectors
 import (
 	"context"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"os/exec"
@@ -69,6 +70,84 @@ type HardwareInfo struct {
 	OSVersion     string
 }
 
+// 静默执行 ghw 函数调用，抑制标准错误输出
+func silentGhwCall(fn func() error) error {
+	// 保存原始标准错误
+	originalStderr := os.Stderr
+	// 创建管道来丢弃错误输出
+	r, w, _ := os.Pipe()
+
+	// 临时重定向标准错误到管道写入端
+	os.Stderr = w
+
+	// 启动 goroutine 从管道读取并丢弃数据
+	done := make(chan struct{})
+	go func() {
+		io.Copy(io.Discard, r)
+		close(done)
+	}()
+
+	// 执行函数
+	err := fn()
+
+	// 关闭写入端，触发读取端 EOF
+	w.Close()
+
+	// 等待读取 goroutine 完成（最多等待 100ms）
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// 关闭读取端并恢复原始标准错误
+	r.Close()
+	os.Stderr = originalStderr
+
+	return err
+}
+
+// 静默获取 Product 信息
+func silentProduct() (*ghw.ProductInfo, error) {
+	var p *ghw.ProductInfo
+	var err error
+	silentErr := silentGhwCall(func() error {
+		p, err = ghw.Product()
+		return err
+	})
+	if silentErr != nil {
+		err = silentErr
+	}
+	return p, err
+}
+
+// 静默获取 Baseboard 信息
+func silentBaseboard() (*ghw.BaseboardInfo, error) {
+	var b *ghw.BaseboardInfo
+	var err error
+	silentErr := silentGhwCall(func() error {
+		b, err = ghw.Baseboard()
+		return err
+	})
+	if silentErr != nil {
+		err = silentErr
+	}
+	return b, err
+}
+
+// 静默获取 Block 信息
+func silentBlock() (*ghw.BlockInfo, error) {
+	var blk *ghw.BlockInfo
+	var err error
+	silentErr := silentGhwCall(func() error {
+		blk, err = ghw.Block()
+		return err
+	})
+	if silentErr != nil {
+		err = silentErr
+	}
+	return blk, err
+}
+
 // 获取硬件信息，带缓存，每8小时刷新一次
 func getHardwareInfo() *HardwareInfo {
 	hardwareInfoCache.Mutex.RLock()
@@ -113,7 +192,7 @@ func collectHardwareInfo() *HardwareInfo {
 	}
 	productCh := make(chan productResult, 1)
 	go func() {
-		p, err := ghw.Product()
+		p, err := silentProduct()
 		productCh <- productResult{p: p, err: err}
 	}()
 	select {
@@ -142,7 +221,7 @@ func collectHardwareInfo() *HardwareInfo {
 	}
 	baseboardCh := make(chan baseboardResult, 1)
 	go func() {
-		b, err := ghw.Baseboard()
+		b, err := silentBaseboard()
 		baseboardCh <- baseboardResult{b: b, err: err}
 	}()
 	select {
@@ -247,7 +326,7 @@ func collectHardwareInfo() *HardwareInfo {
 		}
 		// 方法三：ghw 汇总物理磁盘（若前两者无结果）
 		if total == 0 {
-			if blk, gerr := ghw.Block(); gerr == nil && blk != nil {
+			if blk, gerr := silentBlock(); gerr == nil && blk != nil {
 				for _, d := range blk.Disks {
 					name := d.Name
 					if name == "" {
