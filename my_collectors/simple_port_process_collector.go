@@ -1499,45 +1499,91 @@ func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 			}
 			tcpPortDone[info.Port] = true
 		}
-	}
 
 		// 只对有端口监听的进程进行分组累计
 		if enableProcessAggregation && shouldAggregateProcess(info.ProcessName) {
 			groupKey := info.ProcessName + "|" + info.ExePath
 			if !reportedGroupKeys[groupKey] {
-			// 使用预分组的进程列表，避免重复计算
-			groupInfos := processGroups[groupKey]
+				// 使用预分组的进程列表，避免重复计算
+				groupInfos := processGroups[groupKey]
 
-			// 先更新进程身份信息（解决服务重启问题）- 智能选择PID
-			// 必须在计算性能指标之前更新，确保使用正确的PID
-			if len(groupInfos) > 0 {
-				// 智能选择PID：优先选择存活的进程，确保身份信息准确
-				selectedPid := selectBestPidForIdentity(groupInfos)
-				updateProcessIdentity(info.ProcessName, info.ExePath, selectedPid)
-			}
-
-			// 使用智能进程身份状态检查（解决服务重启问题）
-			// 这会更新进程身份缓存，查找新PID（如果旧PID已死亡）
-			overallAlive, firstAliveState := getProcessIdentityStatus(info.ProcessName, info.ExePath)
-
-			// 计算累计性能指标
-			// 如果groupInfos中的PID都已死亡，但进程身份显示存活，则基于进程身份缓存中的新PID计算
-			var aggregatedStatus *ProcessGroupAggregatedStatus
-			if len(groupInfos) > 0 {
-				// 检查groupInfos中的PID是否都已死亡
-				hasAlivePid := false
-				for _, groupInfo := range groupInfos {
-					if checkProcess(groupInfo.Pid) == 1 {
-						hasAlivePid = true
-						break
-					}
+				// 先更新进程身份信息（解决服务重启问题）- 智能选择PID
+				// 必须在计算性能指标之前更新，确保使用正确的PID
+				if len(groupInfos) > 0 {
+					// 智能选择PID：优先选择存活的进程，确保身份信息准确
+					selectedPid := selectBestPidForIdentity(groupInfos)
+					updateProcessIdentity(info.ProcessName, info.ExePath, selectedPid)
 				}
 
-				if hasAlivePid {
-					// 有存活的PID，正常计算
-					aggregatedStatus = calculateProcessGroupAggregation(info.ProcessName, groupInfos)
+				// 使用智能进程身份状态检查（解决服务重启问题）
+				// 这会更新进程身份缓存，查找新PID（如果旧PID已死亡）
+				overallAlive, firstAliveState := getProcessIdentityStatus(info.ProcessName, info.ExePath)
+
+				// 计算累计性能指标
+				// 如果groupInfos中的PID都已死亡，但进程身份显示存活，则基于进程身份缓存中的新PID计算
+				var aggregatedStatus *ProcessGroupAggregatedStatus
+				if len(groupInfos) > 0 {
+					// 检查groupInfos中的PID是否都已死亡
+					hasAlivePid := false
+					for _, groupInfo := range groupInfos {
+						if checkProcess(groupInfo.Pid) == 1 {
+							hasAlivePid = true
+							break
+						}
+					}
+
+					if hasAlivePid {
+						// 有存活的PID，正常计算
+						aggregatedStatus = calculateProcessGroupAggregation(info.ProcessName, groupInfos)
+					} else if overallAlive == 1 {
+						// groupInfos中的PID都已死亡，但进程身份显示存活（找到了新PID）
+						// 基于进程身份缓存中的新PID计算性能指标
+						processIdentityCache.RLock()
+						identity, exists := processIdentityCache.cache[getProcessIdentityKey(info.ProcessName, info.ExePath)]
+						processIdentityCache.RUnlock()
+
+						if exists && identity.IsAlive && identity.CurrentPid > 0 && isProcessValid(identity.CurrentPid) {
+							// 使用进程身份缓存中的新PID计算性能指标
+							tempInfos := []PortProcessInfo{{
+								ProcessName: info.ProcessName,
+								ExePath:     info.ExePath,
+								Pid:         identity.CurrentPid,
+								Port:        0, // 端口未知，但这不影响性能指标计算
+								Protocol:    TCPProtocol,
+							}}
+							aggregatedStatus = calculateProcessGroupAggregation(info.ProcessName, tempInfos)
+						} else {
+							// 无法获取新PID，使用空状态
+							aggregatedStatus = &ProcessGroupAggregatedStatus{
+								ProcessName:     info.ProcessName,
+								ProcessCount:    0,
+								TotalCPUPercent: 0,
+								TotalMemPercent: 0,
+								TotalVMRSS:      0,
+								TotalVMSize:     0,
+								TotalThreads:    0,
+								TotalIORead:     0,
+								TotalIOWrite:    0,
+								LastUpdate:      time.Now(),
+							}
+						}
+					} else {
+						// 所有进程都已死亡，使用空状态
+						aggregatedStatus = &ProcessGroupAggregatedStatus{
+							ProcessName:     info.ProcessName,
+							ProcessCount:    0,
+							TotalCPUPercent: 0,
+							TotalMemPercent: 0,
+							TotalVMRSS:      0,
+							TotalVMSize:     0,
+							TotalThreads:    0,
+							TotalIORead:     0,
+							TotalIOWrite:    0,
+							LastUpdate:      time.Now(),
+						}
+					}
 				} else if overallAlive == 1 {
-					// groupInfos中的PID都已死亡，但进程身份显示存活（找到了新PID）
+					// groupInfos为空，但进程身份显示存活（新PID还没被扫描到）
 					// 基于进程身份缓存中的新PID计算性能指标
 					processIdentityCache.RLock()
 					identity, exists := processIdentityCache.cache[getProcessIdentityKey(info.ProcessName, info.ExePath)]
@@ -1569,7 +1615,7 @@ func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 						}
 					}
 				} else {
-					// 所有进程都已死亡，使用空状态
+					// 进程已死亡，使用空状态
 					aggregatedStatus = &ProcessGroupAggregatedStatus{
 						ProcessName:     info.ProcessName,
 						ProcessCount:    0,
@@ -1583,170 +1629,123 @@ func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 						LastUpdate:      time.Now(),
 					}
 				}
-			} else if overallAlive == 1 {
-				// groupInfos为空，但进程身份显示存活（新PID还没被扫描到）
-				// 基于进程身份缓存中的新PID计算性能指标
+
+				// 检查进程身份缓存，即使overallAlive == -1，如果缓存中有该进程，也应该生成指标
+				// 保持标签连续性，避免指标消失
 				processIdentityCache.RLock()
-				identity, exists := processIdentityCache.cache[getProcessIdentityKey(info.ProcessName, info.ExePath)]
+				identity, identityExists := processIdentityCache.cache[getProcessIdentityKey(info.ProcessName, info.ExePath)]
 				processIdentityCache.RUnlock()
 
-				if exists && identity.IsAlive && identity.CurrentPid > 0 && isProcessValid(identity.CurrentPid) {
-					// 使用进程身份缓存中的新PID计算性能指标
-					tempInfos := []PortProcessInfo{{
-						ProcessName: info.ProcessName,
-						ExePath:     info.ExePath,
-						Pid:         identity.CurrentPid,
-						Port:        0, // 端口未知，但这不影响性能指标计算
-						Protocol:    TCPProtocol,
-					}}
-					aggregatedStatus = calculateProcessGroupAggregation(info.ProcessName, tempInfos)
-				} else {
-					// 无法获取新PID，使用空状态
-					aggregatedStatus = &ProcessGroupAggregatedStatus{
-						ProcessName:     info.ProcessName,
-						ProcessCount:    0,
-						TotalCPUPercent: 0,
-						TotalMemPercent: 0,
-						TotalVMRSS:      0,
-						TotalVMSize:     0,
-						TotalThreads:    0,
-						TotalIORead:     0,
-						TotalIOWrite:    0,
-						LastUpdate:      time.Now(),
-					}
-				}
-			} else {
-				// 进程已死亡，使用空状态
-				aggregatedStatus = &ProcessGroupAggregatedStatus{
-					ProcessName:     info.ProcessName,
-					ProcessCount:    0,
-					TotalCPUPercent: 0,
-					TotalMemPercent: 0,
-					TotalVMRSS:      0,
-					TotalVMSize:     0,
-					TotalThreads:    0,
-					TotalIORead:     0,
-					TotalIOWrite:    0,
-					LastUpdate:      time.Now(),
-				}
-			}
+				// 如果overallAlive >= 0，或者进程身份缓存中有该进程（说明之前存在过），都生成指标
+				shouldGenerateMetrics := overallAlive >= 0 || identityExists
 
-			// 检查进程身份缓存，即使overallAlive == -1，如果缓存中有该进程，也应该生成指标
-			// 保持标签连续性，避免指标消失
-			processIdentityCache.RLock()
-			identity, identityExists := processIdentityCache.cache[getProcessIdentityKey(info.ProcessName, info.ExePath)]
-			processIdentityCache.RUnlock()
-
-			// 如果overallAlive >= 0，或者进程身份缓存中有该进程（说明之前存在过），都生成指标
-			shouldGenerateMetrics := overallAlive >= 0 || identityExists
-
-			if shouldGenerateMetrics {
-				// 确定使用的状态值
-				var aliveValue int
-				var stateValue string
-				if overallAlive >= 0 {
-					// 有明确的状态，直接使用
-					aliveValue = overallAlive
-					stateValue = firstAliveState
-				} else if identityExists {
-					// overallAlive == -1（未知状态），但进程身份缓存中有该进程
-					// 检查进程是否真的存活（使用快速检查）
-					if identity.IsAlive && identity.CurrentPid > 0 && isProcessValid(identity.CurrentPid) {
-						if checkProcess(identity.CurrentPid) == 1 {
-							// 进程存活，但状态未知（可能是异步检测未完成）
-							aliveValue = 1
-							stateValue = "?"
+				if shouldGenerateMetrics {
+					// 确定使用的状态值
+					var aliveValue int
+					var stateValue string
+					if overallAlive >= 0 {
+						// 有明确的状态，直接使用
+						aliveValue = overallAlive
+						stateValue = firstAliveState
+					} else if identityExists {
+						// overallAlive == -1（未知状态），但进程身份缓存中有该进程
+						// 检查进程是否真的存活（使用快速检查）
+						if identity.IsAlive && identity.CurrentPid > 0 && isProcessValid(identity.CurrentPid) {
+							if checkProcess(identity.CurrentPid) == 1 {
+								// 进程存活，但状态未知（可能是异步检测未完成）
+								aliveValue = 1
+								stateValue = "?"
+							} else {
+								// 进程死亡
+								aliveValue = 0
+								stateValue = "X"
+							}
 						} else {
-							// 进程死亡
+							// 进程身份显示死亡
 							aliveValue = 0
 							stateValue = "X"
 						}
 					} else {
-						// 进程身份显示死亡
-						aliveValue = 0
-						stateValue = "X"
+						// 不应该到达这里，但为了安全
+						aliveValue = -1
+						stateValue = "?"
 					}
-				} else {
-					// 不应该到达这里，但为了安全
-					aliveValue = -1
-					stateValue = "?"
+
+					// 进程存活状态（累计）- 使用智能身份管理
+					// 生成进程存活状态指标（累计）- 使用智能身份管理
+					ch <- prometheus.MustNewConstMetric(
+						c.processAliveDesc, prometheus.GaugeValue, float64(aliveValue),
+						info.ProcessName, info.ExePath, stateValue,
+					)
+
+					// 生成累计的性能指标（进程挂了时设为0）
+					// 使用aliveValue而不是overallAlive，因为aliveValue已经考虑了进程身份缓存
+					var cpuPercent, memPercent, vmRSS, vmSize, threads, ioRead, ioWrite float64
+					if aliveValue == 1 {
+						// 进程存活时使用实际值
+						cpuPercent = aggregatedStatus.TotalCPUPercent
+						memPercent = aggregatedStatus.TotalMemPercent
+						vmRSS = aggregatedStatus.TotalVMRSS * 1024
+						vmSize = aggregatedStatus.TotalVMSize * 1024
+						threads = aggregatedStatus.TotalThreads
+						ioRead = aggregatedStatus.TotalIORead * 1024
+						ioWrite = aggregatedStatus.TotalIOWrite * 1024
+					} else {
+						// 进程挂了时设为0
+						cpuPercent = 0
+						memPercent = 0
+						vmRSS = 0
+						vmSize = 0
+						threads = 0
+						ioRead = 0
+						ioWrite = 0
+					}
+
+					// CPU使用率指标
+					ch <- prometheus.MustNewConstMetric(
+						c.processCPUPercentDesc, prometheus.GaugeValue, cpuPercent,
+						info.ProcessName, info.ExePath,
+					)
+
+					// 内存使用率指标
+					ch <- prometheus.MustNewConstMetric(
+						c.processMemPercentDesc, prometheus.GaugeValue, memPercent,
+						info.ProcessName, info.ExePath,
+					)
+
+					// 物理内存使用量指标（转换为字节）
+					ch <- prometheus.MustNewConstMetric(
+						c.processVMRSSDesc, prometheus.GaugeValue, vmRSS,
+						info.ProcessName, info.ExePath,
+					)
+
+					// 虚拟内存使用量指标（转换为字节）
+					ch <- prometheus.MustNewConstMetric(
+						c.processVMSizeDesc, prometheus.GaugeValue, vmSize,
+						info.ProcessName, info.ExePath,
+					)
+
+					// 线程数量指标
+					ch <- prometheus.MustNewConstMetric(
+						c.processThreadsDesc, prometheus.GaugeValue, threads,
+						info.ProcessName, info.ExePath,
+					)
+
+					// IO读取速率指标（转换为字节/秒）
+					ch <- prometheus.MustNewConstMetric(
+						c.processIOReadDesc, prometheus.GaugeValue, ioRead,
+						info.ProcessName, info.ExePath,
+					)
+
+					// IO写入速率指标（转换为字节/秒）
+					ch <- prometheus.MustNewConstMetric(
+						c.processIOWriteDesc, prometheus.GaugeValue, ioWrite,
+						info.ProcessName, info.ExePath,
+					)
 				}
 
-				// 进程存活状态（累计）- 使用智能身份管理
-				// 生成进程存活状态指标（累计）- 使用智能身份管理
-				ch <- prometheus.MustNewConstMetric(
-					c.processAliveDesc, prometheus.GaugeValue, float64(aliveValue),
-					info.ProcessName, info.ExePath, stateValue,
-				)
-
-				// 生成累计的性能指标（进程挂了时设为0）
-				// 使用aliveValue而不是overallAlive，因为aliveValue已经考虑了进程身份缓存
-				var cpuPercent, memPercent, vmRSS, vmSize, threads, ioRead, ioWrite float64
-				if aliveValue == 1 {
-					// 进程存活时使用实际值
-					cpuPercent = aggregatedStatus.TotalCPUPercent
-					memPercent = aggregatedStatus.TotalMemPercent
-					vmRSS = aggregatedStatus.TotalVMRSS * 1024
-					vmSize = aggregatedStatus.TotalVMSize * 1024
-					threads = aggregatedStatus.TotalThreads
-					ioRead = aggregatedStatus.TotalIORead * 1024
-					ioWrite = aggregatedStatus.TotalIOWrite * 1024
-				} else {
-					// 进程挂了时设为0
-					cpuPercent = 0
-					memPercent = 0
-					vmRSS = 0
-					vmSize = 0
-					threads = 0
-					ioRead = 0
-					ioWrite = 0
-				}
-
-				// CPU使用率指标
-				ch <- prometheus.MustNewConstMetric(
-					c.processCPUPercentDesc, prometheus.GaugeValue, cpuPercent,
-					info.ProcessName, info.ExePath,
-				)
-
-				// 内存使用率指标
-				ch <- prometheus.MustNewConstMetric(
-					c.processMemPercentDesc, prometheus.GaugeValue, memPercent,
-					info.ProcessName, info.ExePath,
-				)
-
-				// 物理内存使用量指标（转换为字节）
-				ch <- prometheus.MustNewConstMetric(
-					c.processVMRSSDesc, prometheus.GaugeValue, vmRSS,
-					info.ProcessName, info.ExePath,
-				)
-
-				// 虚拟内存使用量指标（转换为字节）
-				ch <- prometheus.MustNewConstMetric(
-					c.processVMSizeDesc, prometheus.GaugeValue, vmSize,
-					info.ProcessName, info.ExePath,
-				)
-
-				// 线程数量指标
-				ch <- prometheus.MustNewConstMetric(
-					c.processThreadsDesc, prometheus.GaugeValue, threads,
-					info.ProcessName, info.ExePath,
-				)
-
-				// IO读取速率指标（转换为字节/秒）
-				ch <- prometheus.MustNewConstMetric(
-					c.processIOReadDesc, prometheus.GaugeValue, ioRead,
-					info.ProcessName, info.ExePath,
-				)
-
-				// IO写入速率指标（转换为字节/秒）
-				ch <- prometheus.MustNewConstMetric(
-					c.processIOWriteDesc, prometheus.GaugeValue, ioWrite,
-					info.ProcessName, info.ExePath,
-				)
-			}
-
-			// 标记该进程组已报告，避免重复处理
-			reportedGroupKeys[groupKey] = true
+				// 标记该进程组已报告，避免重复处理
+				reportedGroupKeys[groupKey] = true
 		}
 	}
 }
