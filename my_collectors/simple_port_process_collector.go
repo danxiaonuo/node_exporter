@@ -102,6 +102,14 @@ const (
 	// 进程存活状态信息在缓存中的有效期
 	ProcessAliveExpireTime = time.Hour
 
+	// ProcessDetailedStatusExpireTime 进程详细状态过期时间
+	// 进程详细状态信息在缓存中的有效期
+	ProcessDetailedStatusExpireTime = time.Hour
+
+	// ProcessStatusExpireTime 进程状态过期时间
+	// 进程基础状态信息在缓存中的有效期
+	ProcessStatusExpireTime = time.Hour
+
 	// ========== 缓存大小限制 ==========
 	// MaxStringCacheSize 字符串缓存最大大小
 	// 限制字符串缓存的最大条目数，防止内存无限增长
@@ -3411,7 +3419,7 @@ func startMemoryCleanupWorker() {
 
 // cleanupExpiredCaches 清理过期的缓存数据
 // 该函数定期清理各种缓存中的过期项，防止内存无限增长
-// 包括字符串缓存、进程身份缓存、端口状态缓存和进程存活缓存
+// 包括字符串缓存、进程身份缓存、端口状态缓存、进程存活缓存、进程状态缓存和进程详细状态缓存
 func cleanupExpiredCaches() {
 	now := time.Now()
 
@@ -3485,6 +3493,30 @@ func cleanupExpiredCaches() {
 		}
 	}
 	processAliveCache.RWMutex.Unlock()
+
+	// 清理进程状态缓存中的过期项
+	// 清理超过指定时间未检查的进程基础状态，防止缓存泄漏
+	processStatusCache.Lock()
+	for pid, lastCheck := range processStatusCache.lastCheck {
+		// 清理超过指定时间未检查的进程状态
+		if now.Sub(lastCheck) > ProcessStatusExpireTime {
+			delete(processStatusCache.cache, pid)
+			delete(processStatusCache.lastCheck, pid)
+		}
+	}
+	processStatusCache.Unlock()
+
+	// 清理进程详细状态缓存中的过期项
+	// 清理超过指定时间未检查的进程详细状态，防止缓存泄漏
+	processDetailedStatusCache.Lock()
+	for pid, lastCheck := range processDetailedStatusCache.lastCheck {
+		// 清理超过指定时间未检查的进程详细状态
+		if now.Sub(lastCheck) > ProcessDetailedStatusExpireTime {
+			delete(processDetailedStatusCache.cache, pid)
+			delete(processDetailedStatusCache.lastCheck, pid)
+		}
+	}
+	processDetailedStatusCache.Unlock()
 }
 
 // 获取进程详细状态数据（CPU、内存、IO等）
