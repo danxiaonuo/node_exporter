@@ -1484,17 +1484,18 @@ func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 						c.portTCPAliveDesc, prometheus.GaugeValue, float64(alive), labels...,
 					)
 
-				// 生成TCP端口响应时间指标（端口挂了时响应时间为0）
-				respTime := getPortResponseTime(info.Port)
-				// 检查响应时间是否有效（>=0），避免暴露-1（未知状态）
-				if respTime >= 0 {
-					// 总是暴露响应时间指标，端口挂了时为0
-					if EnablePortCheckDebugLog && respTime > 0 {
-						log.Printf("%s 端口 %d 指标暴露使用缓存响应时间: %.5e", LogPrefix, info.Port, respTime)
+					// 生成TCP端口响应时间指标（端口挂了时响应时间为0）
+					respTime := getPortResponseTime(info.Port)
+					// 检查响应时间是否有效（>=0），避免暴露-1（未知状态）
+					if respTime >= 0 {
+						// 总是暴露响应时间指标，端口挂了时为0
+						if EnablePortCheckDebugLog && respTime > 0 {
+							log.Printf("%s 端口 %d 指标暴露使用缓存响应时间: %.5e", LogPrefix, info.Port, respTime)
+						}
+						ch <- prometheus.MustNewConstMetric(
+							c.portTCPResponseTimeDesc, prometheus.GaugeValue, respTime, labels...,
+						)
 					}
-					ch <- prometheus.MustNewConstMetric(
-						c.portTCPResponseTimeDesc, prometheus.GaugeValue, respTime, labels...,
-					)
 				}
 			}
 			tcpPortDone[info.Port] = true
