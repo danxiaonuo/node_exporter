@@ -1746,6 +1746,7 @@ func (c *SimplePortProcessCollector) Collect(ch chan<- prometheus.Metric) {
 
 				// 标记该进程组已报告，避免重复处理
 				reportedGroupKeys[groupKey] = true
+			}
 		}
 	}
 }
