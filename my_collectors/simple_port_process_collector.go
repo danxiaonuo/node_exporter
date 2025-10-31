@@ -2921,40 +2921,40 @@ func getProcessIdentityStatus(processName, exePath string) (int, string) {
 		if status.Alive == 1 {
 			return 1, status.State // 进程存活
 		} else if status.Alive < 0 {
-			// Alive为-1，表示未知状态（没有历史记录或缓存过期）
-			// 需要快速验证进程是否真的存活，避免返回错误的存活状态
-			// 使用轻量级的进程验证，避免阻塞
-			if isProcessValid(identity.CurrentPid) {
-				// 进程文件存在，快速检查进程状态
-				if checkProcess(identity.CurrentPid) == 1 {
-					// 进程确实存活，返回存活状态
-					return 1, "R" // 返回运行状态
+			// Alive为-1，表示未知状态（没有历史记录或缓存过期，等待异步检测）
+			// 为了提供更好的用户体验，在进程明显不存在时立即返回0，而不是等待异步检测
+			// 但仅在进程文件不存在时才进行快速验证，避免频繁的同步检查
+			// 使用最轻量级的检查：仅检查文件是否存在，不读取内容
+			if !isProcessValid(identity.CurrentPid) {
+				// 进程文件不存在，说明进程已死亡
+				// 先尝试查找同组其他进程（异步操作，但可能会阻塞一小会儿）
+				// 为了性能，仅在文件不存在时才进行查找
+				alivePid := findAliveProcessInGroup(processName, exePath)
+				if alivePid > 0 {
+					// 找到其他存活进程，更新身份信息
+					processIdentityCache.Lock()
+					if updatedIdentity, stillExists := processIdentityCache.cache[key]; stillExists {
+						updatedIdentity.CurrentPid = alivePid
+						updatedIdentity.IsAlive = true
+						updatedIdentity.LastSeen = time.Now()
+						processIdentityCache.cache[key] = updatedIdentity
+					}
+					processIdentityCache.Unlock()
+					go forceRescanPortProcess()
+					return 1, "R" // 进程存活（使用其他PID）
 				}
-			}
-			// 进程不存在或已死亡，标记为非存活并查找其他进程
-			// 不直接返回0，而是先尝试查找同组其他进程
-			alivePid := findAliveProcessInGroup(processName, exePath)
-			if alivePid > 0 {
-				// 找到其他存活进程，更新身份信息
+				// 所有进程都已死，标记为非存活
 				processIdentityCache.Lock()
 				if updatedIdentity, stillExists := processIdentityCache.cache[key]; stillExists {
-					updatedIdentity.CurrentPid = alivePid
-					updatedIdentity.IsAlive = true
-					updatedIdentity.LastSeen = time.Now()
+					updatedIdentity.IsAlive = false
 					processIdentityCache.cache[key] = updatedIdentity
 				}
 				processIdentityCache.Unlock()
-				go forceRescanPortProcess()
-				return 1, "R" // 进程存活（使用其他PID）
+				return 0, "X" // 进程死亡
 			}
-			// 所有进程都已死，标记为非存活
-			processIdentityCache.Lock()
-			if updatedIdentity, stillExists := processIdentityCache.cache[key]; stillExists {
-				updatedIdentity.IsAlive = false
-				processIdentityCache.cache[key] = updatedIdentity
-			}
-			processIdentityCache.Unlock()
-			return 0, "X" // 进程死亡
+			// 进程文件存在但状态未知，返回-1等待异步检测完成
+			// 这样可以避免阻塞，保持异步机制
+			return -1, "?" // 未知状态，等待异步检测
 		} else {
 			// 当前PID已死，尝试查找同组其他存活进程
 			alivePid := findAliveProcessInGroup(processName, exePath)
@@ -3646,11 +3646,14 @@ func getProcessDetailedStatusCached(pid int) *ProcessDetailedStatus {
 		}
 
 		// 尝试将默认状态存入缓存（原子操作，避免竞态条件）
+		// 注意：不更新lastCheck，让缓存立即过期，触发异步检测
 		processDetailedStatusCache.Lock()
 		if _, exists := processDetailedStatusCache.cache[pid]; !exists {
 			// 只有缓存不存在时才写入默认状态，避免覆盖其他goroutine已经写入的真实数据
 			processDetailedStatusCache.cache[pid] = defaultStatus
-			processDetailedStatusCache.lastCheck[pid] = now
+			// 不设置lastCheck或设置为过去的时间，确保下次检查时触发异步检测
+			// 设置为过去的时间（减去间隔），让缓存立即过期
+			processDetailedStatusCache.lastCheck[pid] = now.Add(-processStatusInterval - time.Second)
 		}
 		processDetailedStatusCache.Unlock()
 
