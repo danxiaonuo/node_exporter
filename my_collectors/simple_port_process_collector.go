@@ -2921,9 +2921,40 @@ func getProcessIdentityStatus(processName, exePath string) (int, string) {
 		if status.Alive == 1 {
 			return 1, status.State // 进程存活
 		} else if status.Alive < 0 {
-			// Alive为-1，表示未知状态，等待异步检测完成，不暴露指标
-			// 暂时返回上次已知状态（如果identity.IsAlive为true，说明之前是存活的）
-			return 1, "?" // 暂时返回存活，等待异步更新
+			// Alive为-1，表示未知状态（没有历史记录或缓存过期）
+			// 需要快速验证进程是否真的存活，避免返回错误的存活状态
+			// 使用轻量级的进程验证，避免阻塞
+			if isProcessValid(identity.CurrentPid) {
+				// 进程文件存在，快速检查进程状态
+				if checkProcess(identity.CurrentPid) == 1 {
+					// 进程确实存活，返回存活状态
+					return 1, "R" // 返回运行状态
+				}
+			}
+			// 进程不存在或已死亡，标记为非存活并查找其他进程
+			// 不直接返回0，而是先尝试查找同组其他进程
+			alivePid := findAliveProcessInGroup(processName, exePath)
+			if alivePid > 0 {
+				// 找到其他存活进程，更新身份信息
+				processIdentityCache.Lock()
+				if updatedIdentity, stillExists := processIdentityCache.cache[key]; stillExists {
+					updatedIdentity.CurrentPid = alivePid
+					updatedIdentity.IsAlive = true
+					updatedIdentity.LastSeen = time.Now()
+					processIdentityCache.cache[key] = updatedIdentity
+				}
+				processIdentityCache.Unlock()
+				go forceRescanPortProcess()
+				return 1, "R" // 进程存活（使用其他PID）
+			}
+			// 所有进程都已死，标记为非存活
+			processIdentityCache.Lock()
+			if updatedIdentity, stillExists := processIdentityCache.cache[key]; stillExists {
+				updatedIdentity.IsAlive = false
+				processIdentityCache.cache[key] = updatedIdentity
+			}
+			processIdentityCache.Unlock()
+			return 0, "X" // 进程死亡
 		} else {
 			// 当前PID已死，尝试查找同组其他存活进程
 			alivePid := findAliveProcessInGroup(processName, exePath)
